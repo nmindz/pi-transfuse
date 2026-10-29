@@ -2,3 +2,4 @@
 /exports
 /dist
 /.cargo/config.toml
+.DS_Store
