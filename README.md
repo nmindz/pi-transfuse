@@ -82,6 +82,7 @@ pi-transfuse convert-all <dsh|pi|claude> [--filter TEXT] [--out DIR] [--dry-run]
 pi-transfuse prune-empty [--filter TEXT] [--execute]
 pi-transfuse verify [dsh|pi|claude] [--filter TEXT] [--all]
 pi-transfuse export <id-or-path> [--format md|text] [-o FILE]
+pi-transfuse relocate <OLD_DIR> <NEW_DIR> [--dry-run] [--wait] [--move-dir]
 ```
 
 `<id-or-path>` accepts a session-id prefix or a path to a session file; the direction is inferred from the source. Without `--out`, conversions write into the destination harness's real session root, so the result is immediately listed and resumable there. Claude Code sessions always land in Pi, and `--include-duplicates` imports one even when Pi already holds a copy.
@@ -93,6 +94,12 @@ A cancelled or never-used launch leaves behind a log holding nothing but startup
 Conversion therefore **skips any session with no conversation message** unless `--include-empty` is passed, and the browser hides them until `e` reveals them. `pi-transfuse prune-empty` cleans up a corpus imported before that rule existed: it reports the empty sessions this tool wrote and deletes them under `--execute`. Native sessions of the destination harness are never candidates, empty or not.
 
 A Claude Code session counts as empty when no model ever replied — it ran only slash commands such as `/model` or `/login`, or its prompts went unanswered — and the same rule applies to each of its subagents. Assistant records Claude Code writes itself, such as API errors, are not replies.
+
+### Relocating Pi sessions
+
+`pi-transfuse relocate OLD NEW` moves every Pi session whose header `cwd` is `OLD` or lies under it (on a path-component boundary, so `OLD-other` never matches) to the bucket of the matching path under `NEW`, so `omp --resume` and `omp -c` in `NEW` find them without a re-root prompt. Each session moves as a unit — transcript, artifact directory, lock sidecar — with its header `cwd` and `additionalDirectories` remapped and the old path appended to `previousSessionFiles`; subagent transcripts get the same cwd rewrite. The title slot and every entry stay byte-identical. A failed step rolls the whole session back. Moves rename within a filesystem and otherwise copy, verify size and SHA-256, then delete.
+
+Sessions a running omp holds (`omp session lease`) are reported `held` and skipped; `--wait` polls until they are released. An existing destination is a `conflict`. Terminal breadcrumbs, custom session markers, `history.db` and `composer.db` are updated for moved sessions only (`sqlite3` must be on `PATH`). `--move-dir` renames `OLD` to `NEW` first and refuses a non-empty destination or a cross-filesystem rename; without it, `NEW` must exist. `--dry-run` prints the plan and writes nothing. Exit status: 0 when everything moved, 1 when any session was held, conflicting or failed, 2 on argument or environment errors. Re-running the same command finishes what is left.
 
 ## Mapping
 

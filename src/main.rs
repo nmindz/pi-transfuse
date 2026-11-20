@@ -11,6 +11,7 @@ mod dedup;
 mod dsh;
 mod paths;
 mod pi;
+mod relocate;
 mod transcript;
 mod tui;
 
@@ -155,6 +156,22 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Move every Pi session recorded under OLD_DIR to the matching path under NEW_DIR.
+    Relocate {
+        /// Directory the sessions were recorded in.
+        old_dir: PathBuf,
+        /// Directory they continue in.
+        new_dir: PathBuf,
+        /// Print the plan without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait for a running omp to release a held session instead of skipping it.
+        #[arg(long)]
+        wait: bool,
+        /// Rename OLD_DIR to NEW_DIR first.
+        #[arg(long)]
+        move_dir: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -229,6 +246,19 @@ fn main() -> Result<()> {
             format,
             out,
         } => export(&session, format, out.as_deref()),
+        Command::Relocate { old_dir, new_dir, dry_run, wait, move_dir } => {
+            let request = relocate::Request { old: old_dir, new: new_dir, dry_run, wait, move_dir };
+            match relocate::run(&request, &relocate::Env::from_system()) {
+                Ok(report) => {
+                    report.print();
+                    std::process::exit(report.exit_code());
+                }
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    std::process::exit(2);
+                }
+            }
+        }
     }
 }
 

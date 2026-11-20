@@ -23,6 +23,11 @@ pub fn dsh_root() -> PathBuf {
     }
 }
 
+/// OMP's home directory: `OMP_HOME`, else `~/.omp`.
+pub fn omp_home() -> PathBuf {
+    std::env::var_os("OMP_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".omp"))
+}
+
 /// Root holding Pi per-project session buckets. `OMP_HOME` overrides `~/.omp`.
 pub fn pi_root() -> PathBuf {
     match std::env::var_os("OMP_SESSIONS_DIR") {
