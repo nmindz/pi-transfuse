@@ -87,8 +87,8 @@ pi-transfuse verify [dsh|pi|claude] [--filter TEXT] [--all]
 pi-transfuse export <id-or-path> [--format md|text] [-o FILE]
 pi-transfuse relocate <OLD_DIR> <NEW_DIR> [--dry-run] [--wait] [--move-dir]
 
-pi-transfuse stale [--older-than 30d] [--harness H]... [--filter TEXT] [--sort size|age|project] [--json]
-pi-transfuse compact list|pack|unpack …
+pi-transfuse stale [--older-than 30d] [--include|--exclude FIELD=VALUES]... [--filter TEXT] [--sort KEY] [--reverse] [--json]
+pi-transfuse compact list|pack|unpack|offload …
 pi-transfuse vault init|info|list|push|pull|reindex <STORE> …
 ```
 
@@ -118,22 +118,52 @@ Sessions and their artifact directories pile up. `stale` finds the ones nobody h
 | Local disk keeps | the compressed archive | nothing |
 | Brought back by | `compact unpack` | `vault pull <STORE>` |
 
-```sh
-pi-transfuse stale [--older-than 30d] [--harness pi|dsh|claude]... [--filter TEXT] [--sort size|age|project] [--json]
+`compact offload <DEST>` bridges the two: it moves everything already packed in place into a store at `<DEST>`, so packing in place first and offloading later ends in the same store a `vault push` would have filled.
 
-pi-transfuse compact list   [--harness H]... [--filter TEXT] [--long | --json]
-pi-transfuse compact pack   [SESSION...] [--older-than 30d] [--harness H]... [--filter TEXT] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run]
-pi-transfuse compact unpack [SESSION|ARCHIVE...] [--harness H]... [--filter TEXT] [--keep] [--yes] [--dry-run]
+```sh
+pi-transfuse stale [--older-than 30d] [FILTERS] [--sort KEY] [--reverse] [--json]
+
+pi-transfuse compact list   [FILTERS] [--sort KEY] [--reverse] [--long | --json]
+pi-transfuse compact pack   [SESSION...] [--older-than 30d] [FILTERS] [--sort KEY] [--reverse] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run]
+pi-transfuse compact unpack [SESSION|ARCHIVE...] [FILTERS] [--sort KEY] [--reverse] [--keep] [--yes] [--dry-run]
+pi-transfuse compact offload <DEST> [SESSION|ARCHIVE...] [FILTERS] [--sort KEY] [--reverse] [--pick] [--name NAME] [--keep] [--dry-run]
 
 pi-transfuse vault init    <STORE> [--name NAME]
 pi-transfuse vault info    <STORE>
-pi-transfuse vault list    <STORE> [--harness H]... [--filter TEXT] [--long | --json]
-pi-transfuse vault push    <STORE> [SESSION...] [--older-than 30d] [--harness H]... [--filter TEXT] [--algo gzip|zstd] [--level N] [--threads N] [--keep] [--yes] [--dry-run]
-pi-transfuse vault pull    <STORE> [SESSION|ARCHIVE...] [--harness H]... [--filter TEXT] [--remove] [--yes] [--dry-run]
+pi-transfuse vault list    <STORE> [FILTERS] [--sort KEY] [--reverse] [--long | --json]
+pi-transfuse vault push    <STORE> [SESSION...] [--older-than 30d] [FILTERS] [--sort KEY] [--reverse] [--algo gzip|zstd] [--level N] [--threads N] [--keep] [--yes] [--dry-run]
+pi-transfuse vault pull    <STORE> [SESSION|ARCHIVE...] [FILTERS] [--sort KEY] [--reverse] [--remove] [--yes] [--dry-run]
 pi-transfuse vault reindex <STORE>
+
+FILTERS: [--include FIELD=VALUE[,VALUE…]]... [--exclude FIELD=VALUE[,VALUE…]]... [--filter TEXT]
 ```
 
-A session is everything it owns: a Pi transcript with its artifact directory (subagent transcripts included) and lock sidecar; a DSH session directory with every log generation; a Claude Code transcript with its subagent directory. Its last use is the newest modification time among those paths. `--older-than` takes `30d`, `2w`, `36h`, or a bare number of days. `stale` lists the sessions past the threshold with their sizes and a per-project total, and changes nothing.
+A session is everything it owns: a Pi transcript with its artifact directory (subagent transcripts included) and lock sidecar; a DSH session directory with every log generation; a Claude Code transcript with its subagent directory. Its last use is the newest modification time among those paths. `--older-than` takes `30d`, `2w`, `36h`, or a bare number of days. `stale` lists the sessions past the threshold with their sizes and a per-path total, and changes nothing.
+
+### Sorting and filtering
+
+A session's **path** is the directory it ran in; its **project** is that directory's name, so `~/work/api` and `~/old/api` are two paths of one project.
+
+`--sort` orders listings, the picker's starting order, and the order `--yes` works through. Each key has a natural direction, and `--reverse` flips it:
+
+| Key | Order | Picker key |
+|---|---|---|
+| `used` | last use, oldest first (default for `compact` and `vault push`/`pull`) | `u` |
+| `size` | size before archiving, largest first (default for `stale`) | `s` |
+| `archive` | archive size, largest first; live sessions last | `z` |
+| `created` | creation time, oldest first | `c` |
+| `path` | path, A→Z (default for `vault list`) | `d` |
+| `project` | project name, A→Z, then path | `n` |
+| `harness` | harness | `h` |
+| `title` | title, A→Z | `t` |
+
+`--include FIELD=VALUE[,VALUE…]` keeps sessions matching any of the values; `--exclude` drops them. Both repeat, and a session must match every `--include`. Fields: `harness` (`pi` or `omp`, `dsh`, `claude` or `claude-code`), `project` (folder name, any case), and `path` (that directory and everything below it, on whole path components; `~` expands). Excluded harnesses are not read at all. `--filter TEXT` keeps sessions whose id, title, or path contains the text.
+
+```sh
+pi-transfuse stale --exclude harness=dsh --sort project
+pi-transfuse vault push /Volumes/Backup/pi-vault --include harness=claude-code,omp --exclude path=~/Projects/active
+pi-transfuse compact list --include project=veritas --sort archive --reverse
+```
 
 Exit status of `compact` and `vault`: 0 when every chosen session went through, 1 when any was `held`, a `conflict`, `changed` while packing, or an `error`, 2 on argument or environment errors.
 
@@ -144,15 +174,16 @@ Without session arguments, `pack`, `unpack`, `push` and `pull` open a picker on 
 | Key | Action |
 |---|---|
 | `space` | toggle the session under the cursor |
-| `a` / `A` | select every shown session / clear the selection |
-| `p` | toggle every shown session of the cursor's project |
-| `/` | filter by id, title, or project |
+| `a` / `A` | select every shown session, or deselect them when all are selected (the header checkbox shows `[ ]`, `[-]`, `[x]`) / clear the whole selection |
+| `p` | toggle every shown session in the cursor's path |
+| `/` | filter by id, title, or path |
+| `f` | filter panel: show or hide each harness and project, counted over what the search and threshold leave (`space` toggles, `o` shows only that one, `a` shows all) |
 | `[` / `]` | lower / raise the unused-for threshold through 0, 7, 15, 30, 60, 90, 180, 365 days |
-| `s` | sort oldest first, largest first, or by project |
+| `u` `s` `z` `c` `d` `n` `h` `t` | sort by last used, size, archive size, created, path, project, harness, title; the same key again reverses |
 | `enter` | confirm the selection, or the session under the cursor |
 | `?` / `q` | keys / cancel |
 
-The detail pane shows everything known about the session under the cursor. A session that cannot be restored because a live copy exists is dimmed and cannot be selected. Naming sessions (an id, an id prefix, or an archive path) skips the picker and ignores the threshold, `--yes` takes every match past the threshold, and `--dry-run` prints the plan; off a terminal one of them is required.
+The top bar shows the threshold, the order, and what the filters hide; the detail pane shows everything known about the session under the cursor. Hidden sessions are never acted on, even when selected. A session that cannot be restored because a live copy exists is dimmed and cannot be selected. Naming sessions (an id, an id prefix, or an archive path) skips the picker and ignores the threshold, `--yes` takes every match past the threshold, and `--dry-run` prints the plan; off a terminal one of them is required.
 
 ### Compression
 
@@ -168,6 +199,8 @@ Packing writes the archive under a hidden temporary name, reads it back end to e
 
 `compact pack` replaces each chosen session with `<bucket>/<name>.tar.gz` (or `.tar.zst`) in the bucket it lived in. A packed session drops out of `omp --resume`, the browser, and the other commands until `compact unpack` restores it to the same paths and deletes the archive (`--keep` retains it). `compact list` shows every session packed in place; `--long` prints everything its manifest records, `--json` all of it for scripts.
 
+`compact offload <DEST>` moves every session packed in place, or those the filters, session names, or `--pick` choose, into a store at `<DEST>`: an external disk, a NAS mount, a synced drive. A folder that is not a store yet becomes one (`--name` names it, the folder name by default), and a missing `<DEST>` is created when its parent exists; a missing parent is refused as an unmounted volume. It checks the destination has room for all of it before copying anything. Each archive is copied as it is, verified against its SHA-256, flushed to disk, and only then deleted locally (`--keep` leaves it), and a bucket left empty goes with it. Running it again moves only what was packed since; content the store already holds is not stored twice. `vault pull <DEST>` restores the sessions to the paths they were packed from, and `vault info` and `vault list` describe what is there.
+
 ### Vault
 
 A store is any existing folder after `vault init`: a USB disk, a NAS mount, a Google Drive or Dropbox folder. Every store stands on its own:
@@ -178,7 +211,7 @@ A store is any existing folder after `vault init`: a USB disk, a NAS mount, a Go
   archives/<harness>/<bucket>/<name>.<packed-at>.tar.gz    one per pushed session
 ```
 
-The index records the store's name and id, its creation and last update with the machine behind each, and for every archive its manifest, size and SHA-256, when, from which machine and from which harness root it was pushed, and each restore since. `vault info` summarizes a store by harness, origin machine, and project; `vault list` lists its sessions (`--long` for everything, `--json` for scripts).
+The index records the store's name and id, its creation and last update with the machine behind each, and for every archive its manifest, size and SHA-256, when, from which machine and from which harness root it was pushed, and each restore since. `vault info` summarizes a store by harness, origin machine, and path; `vault list` lists its sessions (`--long` for everything, `--json` for scripts).
 
 `vault push` moves sessions into the store: live sessions pack straight into it, sessions already packed in place are copied as they are, and the local copy is removed once the store's copy checks out (`--keep` leaves it). Content the store already holds for that session is not stored twice. `vault pull` restores sessions to the paths they were packed from, under the current machine's harness root, and keeps the store's copy (`--remove` deletes it); naming a session pulls its newest copy. A session pushed, pulled, continued and pushed again keeps both copies, stamped with their pack times.
 
@@ -282,6 +315,7 @@ src/archive.rs        session archives: manifest, tar, gzip/zstd, read-back veri
 src/compact.rs        compaction in place
 src/vault.rs          backup stores
 src/pick.rs           Ratatui multi-select picker
+src/facts.rs          what sessions sort and filter by: sort keys, --include/--exclude rules
 src/main.rs           CLI
 ```
 

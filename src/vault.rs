@@ -17,7 +17,8 @@ use walkdir::WalkDir;
 
 use crate::archive::{self, Archive, CompressArgs, Manifest, System};
 use crate::compact::{self, Local};
-use crate::units::{self, Act, Age, Candidate, Choice, Ctx, Report, Scope, Status, Unit, Verb};
+use crate::facts::{Facts, Scope, SortArgs, SortKey};
+use crate::units::{self, Act, Age, Candidate, Choice, Ctx, Report, Status, Unit, Verb};
 use crate::{convert, human_size, relocate, Side};
 
 /// The store index, at the top of the store folder.
@@ -68,6 +69,8 @@ pub struct ListArgs {
     pub store: PathBuf,
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Print every recorded detail of each session.
     #[arg(short, long)]
     pub long: bool,
@@ -84,6 +87,8 @@ pub struct PushArgs {
     pub act: Act,
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Offer sessions unused for at least this long: 30d, 2w, 36h, or days.
     #[arg(long, default_value = "30d")]
     pub older_than: Age,
@@ -94,6 +99,33 @@ pub struct PushArgs {
     pub keep: bool,
 }
 
+/// `compact offload`: every session packed in place, moved to a store.
+#[derive(Debug, Args)]
+pub struct OffloadArgs {
+    /// Destination folder: an external disk, a NAS mount, a synced drive. It
+    /// becomes a store when it is not one yet; its parent must exist.
+    pub store: PathBuf,
+    /// Session ids, id prefixes, or archive paths; every session packed in
+    /// place when omitted.
+    pub sessions: Vec<String>,
+    #[command(flatten)]
+    pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
+    /// Choose in the picker instead of taking every match.
+    #[arg(long)]
+    pub pick: bool,
+    /// Name of a store this creates; the folder name by default.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Copy into the store and keep the local archives.
+    #[arg(long)]
+    pub keep: bool,
+    /// Print what would move and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct PullArgs {
     /// Store folder.
@@ -102,6 +134,8 @@ pub struct PullArgs {
     pub act: Act,
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Delete the store's copy once the session is restored.
     #[arg(long)]
     pub remove: bool,
@@ -177,8 +211,8 @@ impl Entry {
         }
     }
 
-    fn search(&self) -> String {
-        format!("{} {} {}", self.manifest.id, self.manifest.title, self.manifest.cwd)
+    fn facts(&self) -> Facts {
+        units::manifest_facts(&self.manifest, self.archive_bytes)
     }
 
     /// Store-side details beyond the manifest's.
@@ -327,11 +361,141 @@ fn init(ctx: &Ctx, dir: &Path, name: Option<String>) -> Result<i32> {
     if dir.join(INDEX).exists() {
         bail!("{} is already a store", dir.display());
     }
+    let index = create_store(ctx, dir, name)?;
+    println!("store {:?} ({}) ready at {}", index.name, index.id, dir.display());
+    Ok(0)
+}
+
+/// Writes a new, empty store index into an existing folder.
+fn create_store(ctx: &Ctx, dir: &Path, name: Option<String>) -> Result<Index> {
     let mut index = new_index(ctx, dir, name.unwrap_or_else(|| folder_name(dir)));
     fs::create_dir_all(dir.join(ARCHIVES)).with_context(|| format!("create {}", dir.join(ARCHIVES).display()))?;
     write_index(dir, &mut index, ctx)?;
-    println!("store {:?} ({}) ready at {}", index.name, index.id, dir.display());
-    Ok(0)
+    Ok(index)
+}
+
+/// The existing folder a store at `dir` lives on: `dir` itself, else its
+/// parent. A missing parent is an error, so an unmounted volume never becomes
+/// a folder quietly created on the boot disk.
+fn existing_home(dir: &Path) -> Result<PathBuf> {
+    if dir.exists() {
+        if !dir.is_dir() {
+            bail!("{} is not a directory", dir.display());
+        }
+        return Ok(dir.to_path_buf());
+    }
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        bail!("{} does not exist; is the volume mounted?", parent.display());
+    }
+    Ok(parent.to_path_buf())
+}
+
+/// Opens the store at `dir`, first making the folder and the store when missing.
+fn open_or_create(ctx: &Ctx, dir: &Path, name: Option<String>) -> Result<Store> {
+    if !dir.join(INDEX).exists() {
+        existing_home(dir)?;
+        if !dir.exists() {
+            fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let index = create_store(ctx, dir, name)?;
+        println!("created store {:?} ({}) at {}", index.name, index.id, dir.display());
+    }
+    Store::open_locked(dir)
+}
+
+/// Bytes free for this user on the filesystem holding `path`.
+#[cfg(unix)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: all-zero is a valid `statvfs` for the call to fill in.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and `stat` is writable.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_: &Path) -> Option<u64> {
+    None
+}
+
+/// Moves sessions packed in place into a store, creating it when needed.
+pub fn offload(ctx: &Ctx, args: &OffloadArgs) -> Result<i32> {
+    let packed = compact::discover(&ctx.roots, &args.scope.sides());
+    let candidates = packed
+        .iter()
+        .map(|local| {
+            // Moving an archive away never conflicts with a live copy.
+            let mut candidate = compact::local_row(ctx, local);
+            candidate.row.blocked = None;
+            candidate
+        })
+        .collect();
+    let act = Act { sessions: args.sessions.clone(), yes: !args.pick, dry_run: args.dry_run };
+    let choice = Choice {
+        title: format!("compact offload → {}", args.store.display()),
+        verb: "offload",
+        threshold: None,
+        sort: args.sort.resolve(SortKey::Used),
+        now_ms: ctx.now_ms,
+    };
+    let chosen: Vec<&Local> =
+        units::choose(candidates, &act, &args.scope, choice)?.into_iter().map(|i| &packed[i]).collect();
+    if chosen.is_empty() {
+        println!("no sessions packed in place match; `pi-transfuse compact pack` packs them");
+        return Ok(0);
+    }
+    let needed: u64 = chosen.iter().map(|l| l.archive_bytes).sum();
+    // Checked before anything is written, dry run included.
+    let home = existing_home(&args.store)?;
+    if let Some(free) = free_bytes(&home) {
+        if free < needed {
+            bail!(
+                "{} needs {} but has {} free; narrow it with --include, --exclude, or session names",
+                args.store.display(),
+                human_size(needed),
+                human_size(free)
+            );
+        }
+    }
+    if args.dry_run {
+        let mut report = Report::new(Verb::Offload, true);
+        for local in &chosen {
+            let m = &local.manifest;
+            report.line(&Status::Would, m.harness, &m.id, &m.title, &human_size(local.archive_bytes));
+            if !args.keep {
+                report.freed += local.archive_bytes;
+            }
+        }
+        let into = if args.store.join(INDEX).exists() { "into the store at" } else { "into a new store at" };
+        println!("{} {into} {}", human_size(needed), args.store.display());
+        return Ok(report.finish());
+    }
+    let mut store = open_or_create(ctx, &args.store, args.name.clone())?;
+    let mut report = Report::new(Verb::Offload, false);
+    let mut unsaved = 0;
+    for local in chosen {
+        let m = &local.manifest;
+        let before = store.index.archives.len();
+        let (status, sizes, freed) = push_local(ctx, &mut store, local, args.keep);
+        report.freed += freed;
+        report.line(&status, m.harness, &m.id, &m.title, &sizes);
+        unsaved += store.index.archives.len() - before;
+        if unsaved >= SAVE_EVERY {
+            store.save(ctx).context(REINDEX_HINT)?;
+            unsaved = 0;
+        }
+    }
+    if unsaved > 0 {
+        store.save(ctx).context(REINDEX_HINT)?;
+    }
+    println!("store {} · restore with `pi-transfuse vault pull {}`", store.label(), store.dir.display());
+    Ok(report.finish())
 }
 
 fn info(_ctx: &Ctx, dir: &Path) -> Result<i32> {
@@ -398,7 +562,7 @@ fn info(_ctx: &Ctx, dir: &Path) -> Result<i32> {
     let mut projects: Vec<(&str, Project)> = projects.into_iter().collect();
     projects.sort_by_key(|(_, p)| std::cmp::Reverse(p.packed));
     if !projects.is_empty() {
-        println!("\nprojects");
+        println!("\nby path");
         for (cwd, p) in projects {
             println!(
                 "  {:>9} of {:>9}  {:>4} session(s)  last used {}  {}",
@@ -415,33 +579,34 @@ fn info(_ctx: &Ctx, dir: &Path) -> Result<i32> {
 
 fn list(ctx: &Ctx, args: &ListArgs) -> Result<i32> {
     let store = Store::open(&args.store)?;
-    let sides = args.scope.sides();
-    let mut entries: Vec<&Entry> = store
+    let mut entries: Vec<(Facts, &Entry)> = store
         .index
         .archives
         .iter()
-        .filter(|e| sides.contains(&e.manifest.harness) && args.scope.admits(&e.search()))
+        .map(|e| (e.facts(), e))
+        .filter(|(f, _)| args.scope.admits(f))
         .collect();
-    entries.sort_by(|a, b| a.manifest.cwd.cmp(&b.manifest.cwd).then(b.manifest.last_used.cmp(&a.manifest.last_used)));
+    let sort = args.sort.resolve(SortKey::Path);
+    entries.sort_by(|(a, _), (b, _)| sort.compare(a, b));
     if args.json {
+        let entries: Vec<&Entry> = entries.iter().map(|(_, e)| *e).collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(0);
     }
     if !args.long {
         units::print_header();
     }
-    for e in &entries {
+    for (facts, e) in &entries {
         let m = &e.manifest;
         if args.long {
             println!("── {} ──", if m.title.is_empty() { &m.id } else { &m.title });
             units::print_details(&e.details(&store.dir, ctx));
             println!();
         } else {
-            let days = units::age_days(ctx.now_ms, m.last_used_ms());
-            units::print_line(days, &human_size(m.bytes), &human_size(e.archive_bytes), m.harness, &m.id, &m.cwd, &m.title);
+            units::print_line(facts, ctx.now_ms);
         }
     }
-    let packed: u64 = entries.iter().map(|e| e.archive_bytes).sum();
+    let packed: u64 = entries.iter().map(|(_, e)| e.archive_bytes).sum();
     println!("{} archive(s) in {} · {}", entries.len(), store.label(), human_size(packed));
     Ok(0)
 }
@@ -473,6 +638,8 @@ fn push(ctx: &Ctx, args: &PushArgs) -> Result<i32> {
         title: format!("vault push → {} · {compression}", store.index.name),
         verb: "push",
         threshold: Some(args.older_than),
+        sort: args.sort.resolve(SortKey::Used),
+        now_ms: ctx.now_ms,
     };
     let chosen = units::choose(candidates, &args.act, &args.scope, choice)?;
     if chosen.is_empty() {
@@ -586,7 +753,10 @@ fn push_local(ctx: &Ctx, store: &mut Store, local: &Local, keep: bool) -> (Statu
             .parent()
             .map_or(Ok(()), |p| fs::create_dir_all(p).with_context(|| format!("create {}", p.display())))
             .and_then(|()| relocate::copy_file(&local.path, &tmp))
-            .and_then(|()| fs::rename(&tmp, &dest).with_context(|| format!("rename into {}", dest.display())));
+            // On disk before the local archive goes, not just in the page cache.
+            .and_then(|()| File::open(&tmp).and_then(|f| f.sync_all()).with_context(|| format!("sync {}", tmp.display())))
+            .and_then(|()| fs::rename(&tmp, &dest).with_context(|| format!("rename into {}", dest.display())))
+            .and_then(|()| sync_dir(&dest));
         if let Err(err) = copied {
             let _ = fs::remove_file(&tmp);
             return (Status::Failed(format!("{err:#}")), sizes, 0);
@@ -598,7 +768,13 @@ fn push_local(ctx: &Ctx, store: &mut Store, local: &Local, keep: bool) -> (Statu
         return (status, sizes, 0);
     }
     match fs::remove_file(&local.path) {
-        Ok(()) => (status, sizes, local.archive_bytes),
+        Ok(()) => {
+            // A bucket left empty goes too; one still holding anything stays.
+            if let Some(bucket) = local.path.parent() {
+                let _ = fs::remove_dir(bucket);
+            }
+            (status, sizes, local.archive_bytes)
+        }
         Err(err) => (Status::Failed(format!("stored, but could not remove {}: {err}", local.path.display())), sizes, 0),
     }
 }
@@ -607,7 +783,13 @@ fn pull(ctx: &Ctx, args: &PullArgs) -> Result<i32> {
     let mut store = Store::open_locked(&args.store)?;
     let sides = args.scope.sides();
     let (order, candidates) = pull_candidates(ctx, &store, &sides);
-    let choice = Choice { title: format!("vault pull ← {}", store.index.name), verb: "pull", threshold: None };
+    let choice = Choice {
+        title: format!("vault pull ← {}", store.index.name),
+        verb: "pull",
+        threshold: None,
+        sort: args.sort.resolve(SortKey::Used),
+        now_ms: ctx.now_ms,
+    };
     let chosen: Vec<usize> =
         units::choose(candidates, &args.act, &args.scope, choice)?.into_iter().map(|k| order[k]).collect();
     if chosen.is_empty() {
@@ -652,13 +834,21 @@ fn pull(ctx: &Ctx, args: &PullArgs) -> Result<i32> {
     Ok(report.finish())
 }
 
+/// Flushes the directory entry of `path` to disk.
+fn sync_dir(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(dir) => File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("sync {}", dir.display())),
+        None => Ok(()),
+    }
+}
+
 /// What `push` offers: every live session, then every session packed in place.
 fn push_candidates<'a>(ctx: &Ctx, live: &'a [Unit], packed: &'a [Local]) -> (Vec<Item<'a>>, Vec<Candidate>) {
     let mut items = Vec::new();
     let mut candidates = Vec::new();
     for unit in live {
         let row = units::unit_row(unit, ctx.roots.of(unit.harness), ctx.now_ms);
-        candidates.push(Candidate { id: unit.id.clone(), path: None, row });
+        candidates.push(Candidate { path: None, row });
         items.push(Item::Live(unit));
     }
     for local in packed {
@@ -681,13 +871,13 @@ fn pull_candidates(ctx: &Ctx, store: &Store, sides: &[Side]) -> (Vec<usize>, Vec
         .map(|&i| {
             let e = &archives[i];
             let path = store.dir.join(&e.file);
-            let mut row = units::archive_row(&e.manifest, e.archive_bytes, &path, ctx.now_ms, Vec::new());
+            let mut row = units::archive_row(&e.manifest, e.archive_bytes, &path, ctx.now_ms);
             row.details = e.details(&store.dir, ctx);
             let taken = e.manifest.occupied(ctx.roots.of(e.manifest.harness));
             if !taken.is_empty() {
                 row.blocked = Some(format!("present locally: {}", taken.join(", ")));
             }
-            Candidate { id: e.manifest.id.clone(), path: Some(path), row }
+            Candidate { path: Some(path), row }
         })
         .collect();
     (order, candidates)
@@ -787,7 +977,11 @@ mod tests {
     }
 
     fn scope() -> Scope {
-        Scope { harness: Vec::new(), filter: None }
+        Scope::default()
+    }
+
+    fn sort() -> SortArgs {
+        SortArgs { sort: None, reverse: false }
     }
 
     fn push_args(store: &Path, sessions: &[&str]) -> PushArgs {
@@ -795,6 +989,7 @@ mod tests {
             store: store.to_path_buf(),
             act: act(sessions),
             scope: scope(),
+            sort: sort(),
             older_than: "0d".parse().unwrap(),
             compress: CompressArgs { algo: Algo::Zstd, level: Some(3), threads: Some(0) },
             keep: false,
@@ -802,7 +997,7 @@ mod tests {
     }
 
     fn pull_args(store: &Path, sessions: &[&str], remove: bool) -> PullArgs {
-        PullArgs { store: store.to_path_buf(), act: act(sessions), scope: scope(), remove }
+        PullArgs { store: store.to_path_buf(), act: act(sessions), scope: scope(), sort: sort(), remove }
     }
 
     fn new_store(scratch: &Scratch, ctx: &Ctx) -> PathBuf {
@@ -869,6 +1064,7 @@ mod tests {
         let pack = compact::Command::Pack(compact::PackArgs {
             act: act(&["one"]),
             scope: scope(),
+            sort: sort(),
             older_than: "0d".parse().unwrap(),
             compress: CompressArgs { algo: Algo::Gzip, level: Some(1), threads: None },
         });
@@ -909,6 +1105,49 @@ mod tests {
         fs::write(&victim, &bytes[..bytes.len() / 2]).unwrap();
         assert_eq!(reindex(&ctx, &store).unwrap(), 1);
         assert_eq!(Store::open(&store).unwrap().index.archives.len(), 1);
+    }
+
+    #[test]
+    fn offload_moves_every_packed_session_into_a_new_store_and_pull_restores_them() {
+        let scratch = Scratch::new("vault-offload");
+        let ctx = scratch.ctx();
+        scratch.pi_session("one", "/work/a");
+        scratch.pi_session("two", "/work/b");
+        scratch.pi_session("live", "/work/c");
+        let before = tree(&scratch.roots.pi);
+        let pack = compact::Command::Pack(compact::PackArgs {
+            act: act(&["one", "two"]),
+            scope: scope(),
+            sort: sort(),
+            older_than: "0d".parse().unwrap(),
+            compress: CompressArgs { algo: Algo::Gzip, level: Some(1), threads: None },
+        });
+        compact::run(&ctx, pack).unwrap();
+        let offload_args = |store: PathBuf| OffloadArgs {
+            store,
+            sessions: Vec::new(),
+            scope: scope(),
+            sort: sort(),
+            pick: false,
+            name: None,
+            keep: false,
+            dry_run: false,
+        };
+
+        let unmounted = scratch.dir.join("Volumes/Gone/vault");
+        assert!(offload(&ctx, &offload_args(unmounted.clone())).is_err());
+        assert!(!unmounted.parent().unwrap().exists(), "nothing created for a missing volume");
+
+        let store = scratch.dir.join("vault");
+        assert_eq!(offload(&ctx, &offload_args(store.clone())).unwrap(), 0);
+        assert!(compact::discover(&ctx.roots, &[Side::Pi]).is_empty());
+        let live = units::discover(&ctx.roots, &[Side::Pi]);
+        assert_eq!(live.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec!["live"], "live sessions stay");
+        let index = Store::open(&store).unwrap().index;
+        assert_eq!(index.archives.len(), 2);
+
+        assert_eq!(pull(&ctx, &pull_args(&store, &[], false)).unwrap(), 0);
+        assert_eq!(tree(&scratch.roots.pi), before);
     }
 
     #[test]

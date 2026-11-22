@@ -11,16 +11,14 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::archive::{Manifest, Refusal, System};
+use crate::facts::{self, Facts, Scope, Sort, SortArgs, SortKey};
 use crate::paths::{self, Roots};
 use crate::{claude, clip, convert, dsh, human_size, pick, relocate, Side};
-
-/// Every harness, in listing order.
-pub const ALL_SIDES: [Side; 3] = [Side::Pi, Side::Dsh, Side::Claude];
 
 const DAY_MS: f64 = 86_400_000.0;
 
@@ -371,32 +369,6 @@ pub fn age_label(days: f64) -> String {
     }
 }
 
-/// Which sessions a command considers.
-#[derive(Debug, Args)]
-pub struct Scope {
-    /// Only this harness; repeat for several. Every harness when omitted.
-    #[arg(long = "harness", value_enum)]
-    pub harness: Vec<Side>,
-    /// Keep only sessions whose title, project, or id contains this text.
-    #[arg(short, long)]
-    pub filter: Option<String>,
-}
-
-impl Scope {
-    pub fn sides(&self) -> Vec<Side> {
-        if self.harness.is_empty() {
-            ALL_SIDES.to_vec()
-        } else {
-            ALL_SIDES.iter().copied().filter(|s| self.harness.contains(s)).collect()
-        }
-    }
-
-    /// True when `search` passes `--filter`.
-    pub fn admits(&self, search: &str) -> bool {
-        self.filter.as_deref().is_none_or(|needle| search.to_lowercase().contains(&needle.to_lowercase()))
-    }
-}
-
 /// How a command chooses what to act on.
 #[derive(Debug, Args)]
 pub struct Act {
@@ -411,30 +383,20 @@ pub struct Act {
     pub dry_run: bool,
 }
 
-/// Sort order of a listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Sort {
-    /// Largest first.
-    Size,
-    /// Longest unused first.
-    Age,
-    /// By project, then longest unused first.
-    Project,
-}
-
 /// One thing the user can choose.
 pub struct Candidate {
-    pub id: String,
     /// Archive file, for candidates the user can name by path.
     pub path: Option<PathBuf>,
     pub row: pick::Row,
 }
 
-/// The picker's framing for one command.
+/// The picker's framing and the order of one command.
 pub struct Choice {
     pub title: String,
     pub verb: &'static str,
     pub threshold: Option<Age>,
+    pub sort: Sort,
+    pub now_ms: i64,
 }
 
 /// Columns of every picker.
@@ -444,14 +406,14 @@ pub const HEADERS: [&str; 6] = ["unused", "size", "archive", "harness", "project
 /// ones; else, under `--yes` (or `--dry-run` off a terminal), every match old
 /// enough; else the user's picks. Cancelling picks nothing.
 pub fn choose(candidates: Vec<Candidate>, act: &Act, scope: &Scope, choice: Choice) -> Result<Vec<usize>> {
-    let pool: Vec<(usize, Candidate)> =
-        candidates.into_iter().enumerate().filter(|(_, c)| scope.admits(&c.row.search)).collect();
+    let mut pool: Vec<(usize, Candidate)> =
+        candidates.into_iter().enumerate().filter(|(_, c)| scope.admits(&c.row.facts)).collect();
+    pool.sort_by(|(_, a), (_, b)| choice.sort.compare(&a.row.facts, &b.row.facts));
     if !act.sessions.is_empty() {
         return named(&pool, &act.sessions);
     }
-    let old_enough = |c: &Candidate| match (choice.threshold, c.row.age_days) {
-        (Some(age), Some(days)) => days >= age.days,
-        _ => true,
+    let old_enough = |c: &Candidate| {
+        choice.threshold.is_none_or(|age| age_days(choice.now_ms, c.row.facts.last_used_ms) >= age.days)
     };
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if act.yes || (act.dry_run && !interactive) {
@@ -471,12 +433,15 @@ pub fn choose(candidates: Vec<Candidate>, act: &Act, scope: &Scope, choice: Choi
         headers: HEADERS.iter().map(|h| h.to_string()).collect(),
         rows,
         threshold_days: choice.threshold.map(|age| age.days.round() as u32),
+        sort: choice.sort,
+        now_ms: choice.now_ms,
     };
     Ok(pick::pick(spec)?.map(|picked| picked.into_iter().map(|k| index[k]).collect()).unwrap_or_default())
 }
 
 /// Candidates the user named: an archive path, or an id prefix that names one
-/// session. Several candidates of that session resolve to the first.
+/// session. Several candidates of that session resolve to the one offered
+/// first, whatever order the listing is sorted in.
 fn named(pool: &[(usize, Candidate)], names: &[String]) -> Result<Vec<usize>> {
     let mut out: Vec<usize> = Vec::new();
     for name in names {
@@ -490,11 +455,11 @@ fn named(pool: &[(usize, Candidate)], names: &[String]) -> Result<Vec<usize>> {
         }
         let lower = name.to_lowercase();
         let hits: Vec<&(usize, Candidate)> =
-            pool.iter().filter(|(_, c)| c.id.to_lowercase().starts_with(&lower)).collect();
-        let ids: BTreeSet<&str> = hits.iter().map(|(_, c)| c.id.as_str()).collect();
+            pool.iter().filter(|(_, c)| c.row.facts.id.to_lowercase().starts_with(&lower)).collect();
+        let ids: BTreeSet<&str> = hits.iter().map(|(_, c)| c.row.facts.id.as_str()).collect();
         match ids.len() {
             0 => bail!("nothing here matches {name:?}"),
-            1 => out.push(hits[0].0),
+            1 => out.extend(hits.iter().map(|(i, _)| *i).min()),
             _ => bail!("{name:?} matches several sessions: {}", ids.into_iter().collect::<Vec<_>>().join(", ")),
         }
     }
@@ -543,52 +508,61 @@ pub fn tilde(path: &str) -> String {
     }
 }
 
-/// Picker row for a live session under `root`.
-pub fn unit_row(unit: &Unit, root: &Path, now_ms: i64) -> pick::Row {
-    let days = age_days(now_ms, unit.last_used_ms);
-    pick::Row {
-        columns: vec![
-            age_label(days),
-            human_size(unit.bytes),
-            "—".to_string(),
-            unit.harness.key().to_string(),
-            tilde(&unit.cwd),
-            title_or_id(&unit.title, &unit.id),
-        ],
-        group: unit.cwd.clone(),
-        age_days: Some(days),
+/// What a live session sorts and filters by.
+pub fn unit_facts(unit: &Unit) -> Facts {
+    Facts {
+        harness: unit.harness,
+        id: unit.id.clone(),
+        title: unit.title.clone(),
+        path: unit.cwd.clone(),
+        project: facts::project_name(&unit.cwd),
+        created_ms: unit.created_ms,
+        last_used_ms: unit.last_used_ms,
         bytes: unit.bytes,
-        details: unit_details(unit, root, now_ms),
-        search: format!("{} {} {}", unit.id, unit.title, unit.cwd),
-        blocked: None,
+        archive_bytes: None,
     }
 }
 
-/// Picker row for an archived session; `extra` details follow the manifest's.
-pub fn archive_row(
-    manifest: &Manifest,
-    archive_bytes: u64,
-    path: &Path,
-    now_ms: i64,
-    extra: Vec<(String, String)>,
-) -> pick::Row {
-    let days = age_days(now_ms, manifest.last_used_ms());
-    let mut details = manifest_details(manifest, archive_bytes, path, now_ms);
-    details.extend(extra);
+/// What an archived session sorts and filters by.
+pub fn manifest_facts(m: &Manifest, archive_bytes: u64) -> Facts {
+    Facts {
+        harness: m.harness,
+        id: m.id.clone(),
+        title: m.title.clone(),
+        path: m.cwd.clone(),
+        project: facts::project_name(&m.cwd),
+        created_ms: convert::from_iso(&m.created).unwrap_or(0),
+        last_used_ms: m.last_used_ms(),
+        bytes: m.bytes,
+        archive_bytes: Some(archive_bytes),
+    }
+}
+
+/// Picker cells, in [`HEADERS`] order.
+fn columns(f: &Facts, now_ms: i64) -> Vec<String> {
+    vec![
+        age_label(age_days(now_ms, f.last_used_ms)),
+        human_size(f.bytes),
+        f.archive_bytes.map_or_else(|| "—".to_string(), human_size),
+        f.harness.key().to_string(),
+        f.project.clone(),
+        title_or_id(&f.title, &f.id),
+    ]
+}
+
+/// Picker row for a live session under `root`.
+pub fn unit_row(unit: &Unit, root: &Path, now_ms: i64) -> pick::Row {
+    let facts = unit_facts(unit);
+    pick::Row { columns: columns(&facts, now_ms), facts, details: unit_details(unit, root, now_ms), blocked: None }
+}
+
+/// Picker row for an archived session.
+pub fn archive_row(manifest: &Manifest, archive_bytes: u64, path: &Path, now_ms: i64) -> pick::Row {
+    let facts = manifest_facts(manifest, archive_bytes);
     pick::Row {
-        columns: vec![
-            age_label(days),
-            human_size(manifest.bytes),
-            human_size(archive_bytes),
-            manifest.harness.key().to_string(),
-            tilde(&manifest.cwd),
-            title_or_id(&manifest.title, &manifest.id),
-        ],
-        group: manifest.cwd.clone(),
-        age_days: Some(days),
-        bytes: manifest.bytes,
-        details,
-        search: format!("{} {} {}", manifest.id, manifest.title, manifest.cwd),
+        columns: columns(&facts, now_ms),
+        facts,
+        details: manifest_details(manifest, archive_bytes, path, now_ms),
         blocked: None,
     }
 }
@@ -619,7 +593,8 @@ fn unit_details(unit: &Unit, root: &Path, now_ms: i64) -> Vec<(String, String)> 
         detail("id", unit.id.clone()),
         detail("title", unit.title.clone()),
         detail("harness", unit.harness.key()),
-        detail("project", unit.cwd.clone()),
+        detail("project", facts::project_name(&unit.cwd)),
+        detail("path", unit.cwd.clone()),
         detail("created", when(&convert::iso(unit.created_ms), now_ms)),
         detail("last used", when(&convert::iso(unit.last_used_ms), now_ms)),
         detail("size", format!("{} in {} files", human_size(unit.bytes), unit.files)),
@@ -639,7 +614,8 @@ pub fn manifest_details(m: &Manifest, archive_bytes: u64, path: &Path, now_ms: i
         detail("id", m.id.clone()),
         detail("title", m.title.clone()),
         detail("harness", m.harness.key()),
-        detail("project", m.cwd.clone()),
+        detail("project", facts::project_name(&m.cwd)),
+        detail("path", m.cwd.clone()),
         detail("created", when(&m.created, now_ms)),
         detail("last used", when(&m.last_used, now_ms)),
         detail("size", format!("{} in {} files", human_size(m.bytes), m.files)),
@@ -671,24 +647,25 @@ pub fn print_details(details: &[(String, String)]) {
     }
 }
 
-/// One listing line: age, sizes, harness, id, project, title.
-pub fn print_line(days: f64, size: &str, archive: &str, harness: Side, id: &str, cwd: &str, title: &str) {
+/// One listing line: age, sizes, harness, id, project, path, title.
+pub fn print_line(f: &Facts, now_ms: i64) {
     println!(
-        "{:>6}  {:>9}  {:>9}  {:<6}  {:<36}  {:<32}  {}",
-        age_label(days),
-        size,
-        archive,
-        harness.key(),
-        id,
-        crate::shorten(&tilde(cwd), 32),
-        clip(title, 60)
+        "{:>6}  {:>9}  {:>9}  {:<6}  {:<36}  {:<20}  {:<32}  {}",
+        age_label(age_days(now_ms, f.last_used_ms)),
+        human_size(f.bytes),
+        f.archive_bytes.map_or_else(|| "—".to_string(), human_size),
+        f.harness.key(),
+        f.id,
+        clip(&f.project, 20),
+        crate::shorten(&tilde(&f.path), 32),
+        clip(&f.title, 60)
     );
 }
 
 pub fn print_header() {
     println!(
-        "{:>6}  {:>9}  {:>9}  {:<6}  {:<36}  {:<32}  title",
-        "unused", "size", "archive", "harness", "id", "project"
+        "{:>6}  {:>9}  {:>9}  {:<6}  {:<36}  {:<20}  {:<32}  title",
+        "unused", "size", "archive", "harness", "id", "project", "path"
     );
 }
 
@@ -699,6 +676,7 @@ pub enum Verb {
     Unpack,
     Push,
     Pull,
+    Offload,
 }
 
 impl Verb {
@@ -708,6 +686,7 @@ impl Verb {
             Verb::Unpack => "unpack",
             Verb::Push => "push",
             Verb::Pull => "pull",
+            Verb::Offload => "offload",
         }
     }
 
@@ -717,6 +696,7 @@ impl Verb {
             Verb::Unpack => "unpacked",
             Verb::Push => "pushed",
             Verb::Pull => "pulled",
+            Verb::Offload => "offloaded",
         }
     }
 }
@@ -830,9 +810,8 @@ pub struct StaleArgs {
     pub older_than: Age,
     #[command(flatten)]
     pub scope: Scope,
-    /// Order of the listing.
-    #[arg(long, value_enum, default_value = "size")]
-    pub sort: Sort,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Print JSON instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -842,41 +821,38 @@ pub fn stale(ctx: &Ctx, args: &StaleArgs) -> Result<()> {
     let all = discover(&ctx.roots, &args.scope.sides());
     let total_bytes: u64 = all.iter().map(|u| u.bytes).sum();
     let total = all.len();
-    let mut old: Vec<Unit> = all
+    let mut old: Vec<(Facts, Unit)> = all
         .into_iter()
         .filter(|u| age_days(ctx.now_ms, u.last_used_ms) >= args.older_than.days)
-        .filter(|u| args.scope.admits(&format!("{} {} {}", u.id, u.title, u.cwd)))
+        .map(|u| (unit_facts(&u), u))
+        .filter(|(f, _)| args.scope.admits(f))
         .collect();
-    match args.sort {
-        Sort::Size => old.sort_by_key(|u| std::cmp::Reverse(u.bytes)),
-        Sort::Age => old.sort_by_key(|u| u.last_used_ms),
-        Sort::Project => old.sort_by(|a, b| a.cwd.cmp(&b.cwd).then(a.last_used_ms.cmp(&b.last_used_ms))),
-    }
+    let sort = args.sort.resolve(SortKey::Size);
+    old.sort_by(|(a, _), (b, _)| sort.compare(a, b));
     if args.json {
-        let rows: Vec<Value> = old.iter().map(|u| unit_json(u, ctx)).collect();
+        let rows: Vec<Value> = old.iter().map(|(_, u)| unit_json(u, ctx)).collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     print_header();
-    for unit in &old {
-        let days = age_days(ctx.now_ms, unit.last_used_ms);
-        print_line(days, &human_size(unit.bytes), "—", unit.harness, &unit.id, &unit.cwd, &unit.title);
+    for (facts, _) in &old {
+        print_line(facts, ctx.now_ms);
     }
-    let mut projects: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
-    for unit in &old {
-        let slot = projects.entry(unit.cwd.as_str()).or_default();
+    let mut by_path: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    for (_, unit) in &old {
+        let slot = by_path.entry(unit.cwd.as_str()).or_default();
         slot.0 += 1;
         slot.1 += unit.bytes;
     }
-    let mut projects: Vec<(&str, (usize, u64))> = projects.into_iter().collect();
-    projects.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
-    if !projects.is_empty() {
-        println!("\nby project:");
-        for (cwd, (count, bytes)) in projects {
+    let mut by_path: Vec<(&str, (usize, u64))> = by_path.into_iter().collect();
+    by_path.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    if !by_path.is_empty() {
+        println!("\nby path:");
+        for (cwd, (count, bytes)) in by_path {
             println!("  {:>9}  {count:>4} session(s)  {}", human_size(bytes), tilde(cwd));
         }
     }
-    let bytes: u64 = old.iter().map(|u| u.bytes).sum();
+    let bytes: u64 = old.iter().map(|(_, u)| u.bytes).sum();
     println!(
         "\n{} session(s) unused ≥ {} · {} (of {} across {total} sessions)",
         old.len(),
@@ -891,6 +867,7 @@ fn unit_json(unit: &Unit, ctx: &Ctx) -> Value {
     let root = ctx.roots.of(unit.harness);
     json!({
         "harness": unit.harness,
+        "project": facts::project_name(&unit.cwd),
         "id": unit.id,
         "title": unit.title,
         "cwd": unit.cwd,

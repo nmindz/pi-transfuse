@@ -9,8 +9,9 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use crate::archive::{self, CompressArgs, Manifest};
+use crate::facts::{Facts, Scope, SortArgs, SortKey};
 use crate::paths::Roots;
-use crate::units::{self, Act, Age, Candidate, Choice, Ctx, Report, Scope, Status, Unit, Verb};
+use crate::units::{self, Act, Age, Candidate, Choice, Ctx, Report, Status, Unit, Verb};
 use crate::{human_size, Side};
 
 #[derive(Debug, Subcommand)]
@@ -21,12 +22,18 @@ pub enum Command {
     Pack(PackArgs),
     /// Unpack sessions packed in place back where they were.
     Unpack(UnpackArgs),
+    /// Move every session packed in place to a backup store folder (external
+    /// disk, NAS, synced drive), creating the store when needed; `vault pull`
+    /// restores them.
+    Offload(crate::vault::OffloadArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Print every recorded detail of each session.
     #[arg(short, long)]
     pub long: bool,
@@ -41,6 +48,8 @@ pub struct PackArgs {
     pub act: Act,
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Offer sessions unused for at least this long: 30d, 2w, 36h, or days.
     #[arg(long, default_value = "30d")]
     pub older_than: Age,
@@ -54,6 +63,8 @@ pub struct UnpackArgs {
     pub act: Act,
     #[command(flatten)]
     pub scope: Scope,
+    #[command(flatten)]
+    pub sort: SortArgs,
     /// Keep the archive after unpacking.
     #[arg(long)]
     pub keep: bool,
@@ -64,6 +75,7 @@ pub fn run(ctx: &Ctx, command: Command) -> Result<i32> {
         Command::List(args) => list(ctx, &args).map(|()| 0),
         Command::Pack(args) => pack(ctx, &args),
         Command::Unpack(args) => unpack(ctx, &args),
+        Command::Offload(args) => crate::vault::offload(ctx, &args),
     }
 }
 
@@ -113,23 +125,30 @@ fn bucket_archives(side: Side, bucket: &Path) -> Vec<Local> {
 
 /// Picker row for a session packed in place; blocked while it exists live.
 pub fn local_row(ctx: &Ctx, local: &Local) -> units::Candidate {
-    let mut row = units::archive_row(&local.manifest, local.archive_bytes, &local.path, ctx.now_ms, Vec::new());
+    let mut row = units::archive_row(&local.manifest, local.archive_bytes, &local.path, ctx.now_ms);
     let taken = local.manifest.occupied(ctx.roots.of(local.manifest.harness));
     if !taken.is_empty() {
         row.blocked = Some(format!("a live copy exists: {}", taken.join(", ")));
     }
-    Candidate { id: local.manifest.id.clone(), path: Some(local.path.clone()), row }
+    Candidate { path: Some(local.path.clone()), row }
+}
+
+fn local_facts(local: &Local) -> Facts {
+    units::manifest_facts(&local.manifest, local.archive_bytes)
 }
 
 fn list(ctx: &Ctx, args: &ListArgs) -> Result<()> {
-    let locals: Vec<Local> = discover(&ctx.roots, &args.scope.sides())
+    let mut locals: Vec<(Facts, Local)> = discover(&ctx.roots, &args.scope.sides())
         .into_iter()
-        .filter(|l| args.scope.admits(&format!("{} {} {}", l.manifest.id, l.manifest.title, l.manifest.cwd)))
+        .map(|l| (local_facts(&l), l))
+        .filter(|(f, _)| args.scope.admits(f))
         .collect();
+    let sort = args.sort.resolve(SortKey::Used);
+    locals.sort_by(|(a, _), (b, _)| sort.compare(a, b));
     if args.json {
         let rows: Vec<_> = locals
             .iter()
-            .map(|l| json!({"archive": l.path, "archiveBytes": l.archive_bytes, "manifest": l.manifest}))
+            .map(|(_, l)| json!({"archive": l.path, "archiveBytes": l.archive_bytes, "manifest": l.manifest}))
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
@@ -137,20 +156,18 @@ fn list(ctx: &Ctx, args: &ListArgs) -> Result<()> {
     if !args.long {
         units::print_header();
     }
-    for local in &locals {
+    for (facts, local) in &locals {
         let m = &local.manifest;
-        let days = units::age_days(ctx.now_ms, m.last_used_ms());
         if args.long {
             println!("── {} ──", if m.title.is_empty() { &m.id } else { &m.title });
             units::print_details(&units::manifest_details(m, local.archive_bytes, &local.path, ctx.now_ms));
             println!();
         } else {
-            let size = human_size(m.bytes);
-            units::print_line(days, &size, &human_size(local.archive_bytes), m.harness, &m.id, &m.cwd, &m.title);
+            units::print_line(facts, ctx.now_ms);
         }
     }
-    let original: u64 = locals.iter().map(|l| l.manifest.bytes).sum();
-    let packed: u64 = locals.iter().map(|l| l.archive_bytes).sum();
+    let original: u64 = locals.iter().map(|(_, l)| l.manifest.bytes).sum();
+    let packed: u64 = locals.iter().map(|(_, l)| l.archive_bytes).sum();
     println!(
         "{} session(s) packed in place · {} holding {} of sessions",
         locals.len(),
@@ -170,12 +187,14 @@ fn pack(ctx: &Ctx, args: &PackArgs) -> Result<i32> {
     let found = units::discover(&ctx.roots, &args.scope.sides());
     let candidates = found
         .iter()
-        .map(|u| Candidate { id: u.id.clone(), path: None, row: units::unit_row(u, ctx.roots.of(u.harness), ctx.now_ms) })
+        .map(|u| Candidate { path: None, row: units::unit_row(u, ctx.roots.of(u.harness), ctx.now_ms) })
         .collect();
     let choice = Choice {
         title: format!("compact pack · in place · {compression}"),
         verb: "pack",
         threshold: Some(args.older_than),
+        sort: args.sort.resolve(SortKey::Used),
+        now_ms: ctx.now_ms,
     };
     let chosen: Vec<&Unit> =
         units::choose(candidates, &args.act, &args.scope, choice)?.into_iter().map(|i| &found[i]).collect();
@@ -218,7 +237,13 @@ fn pack(ctx: &Ctx, args: &PackArgs) -> Result<i32> {
 fn unpack(ctx: &Ctx, args: &UnpackArgs) -> Result<i32> {
     let locals = discover(&ctx.roots, &args.scope.sides());
     let candidates = locals.iter().map(|l| local_row(ctx, l)).collect();
-    let choice = Choice { title: "compact unpack · back into place".to_string(), verb: "unpack", threshold: None };
+    let choice = Choice {
+        title: "compact unpack · back into place".to_string(),
+        verb: "unpack",
+        threshold: None,
+        sort: args.sort.resolve(SortKey::Used),
+        now_ms: ctx.now_ms,
+    };
     let chosen: Vec<&Local> =
         units::choose(candidates, &args.act, &args.scope, choice)?.into_iter().map(|i| &locals[i]).collect();
     if chosen.is_empty() {
@@ -264,13 +289,18 @@ mod tests {
     }
 
     fn scope() -> Scope {
-        Scope { harness: vec![Side::Pi], filter: None }
+        Scope { include: vec!["harness=pi".parse().unwrap()], ..Scope::default() }
+    }
+
+    fn sort() -> SortArgs {
+        SortArgs { sort: None, reverse: false }
     }
 
     fn pack_args(algo: Algo, sessions: &[&str]) -> PackArgs {
         PackArgs {
             act: act(sessions),
             scope: scope(),
+            sort: sort(),
             older_than: "0d".parse().unwrap(),
             compress: CompressArgs { algo, level: None, threads: Some(0) },
         }
@@ -293,7 +323,7 @@ mod tests {
         assert!(local.manifest.members.iter().all(|m| !scratch.roots.pi.join(m).exists()));
         assert_eq!(units::discover(&ctx.roots, &[Side::Pi]).len(), 1, "only the other session stays live");
 
-        let args = UnpackArgs { act: act(&["one"]), scope: scope(), keep: false };
+        let args = UnpackArgs { act: act(&["one"]), scope: scope(), sort: sort(), keep: false };
         assert_eq!(unpack(&ctx, &args).unwrap(), 0);
         assert_eq!(tree(&scratch.roots.pi), before);
     }
@@ -318,7 +348,7 @@ mod tests {
         scratch.pi_session("one", "/work/a");
         pack(&ctx, &pack_args(Algo::Gzip, &["one"])).unwrap();
         scratch.pi_session("one", "/work/a");
-        let args = UnpackArgs { act: act(&["one"]), scope: scope(), keep: false };
+        let args = UnpackArgs { act: act(&["one"]), scope: scope(), sort: sort(), keep: false };
         assert_eq!(unpack(&ctx, &args).unwrap(), 1);
         assert_eq!(discover(&ctx.roots, &[Side::Pi]).len(), 1);
     }

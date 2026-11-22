@@ -11,6 +11,7 @@ mod compact;
 mod convert;
 mod dedup;
 mod dsh;
+mod facts;
 mod paths;
 mod pi;
 mod pick;
@@ -31,9 +32,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub enum Side {
     /// DeepSeek Harness.
     Dsh,
-    /// Oh My Pi.
+    /// Oh My Pi; also `omp`.
+    #[value(alias = "omp")]
     Pi,
-    /// Claude Code; its sessions import into Pi, nothing converts into it.
+    /// Claude Code, also `claude-code`; its sessions import into Pi, nothing converts into it.
+    #[value(alias = "claude-code")]
     Claude,
 }
 
