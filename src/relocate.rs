@@ -321,7 +321,7 @@ fn resolve(path: &Path) -> PathBuf {
 }
 
 /// Finds an executable on `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
@@ -369,7 +369,7 @@ fn device(_: &fs::Metadata) -> u64 {
 }
 
 /// Session ids a running omp holds; ids omp cannot judge count as held.
-fn lease(omp: &Path, ids: &[String]) -> Result<HashSet<String>> {
+pub(crate) fn lease(omp: &Path, ids: &[String]) -> Result<HashSet<String>> {
     let out = Command::new(omp)
         .args(["session", "lease", "--json", "--"])
         .args(ids)
@@ -559,9 +559,9 @@ fn splice(path: &Path, bytes: &[u8], start: usize, end: usize, line: &[u8]) -> R
 }
 
 /// Writes through a temp file in the same directory, then renames over `path`.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.relocate-{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(".{name}.pi-transfuse-{}.tmp", std::process::id()));
     let result = (|| {
         let mut file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(bytes)?;
@@ -627,7 +627,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_file(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_file(from: &Path, to: &Path) -> Result<()> {
     fs::copy(from, to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
     let (a, b) = (digest(from)?, digest(to)?);
     if a != b {
@@ -636,7 +636,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn digest(path: &Path) -> Result<(u64, Vec<u8>)> {
+pub(crate) fn digest(path: &Path) -> Result<(u64, Vec<u8>)> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
@@ -1008,7 +1008,8 @@ mod tests {
         let held_file = fx.held_file.clone();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            fs::write(held_file, r#"{"held":[],"unknown":[]}"#).unwrap();
+            // Replace atomically: the fake omp may be reading it right now.
+            write_atomic(&held_file, br#"{"held":[],"unknown":[]}"#).unwrap();
         });
         // Still held at the first check; --wait polls until released.
         let mut req = fx.request(&old, &new);

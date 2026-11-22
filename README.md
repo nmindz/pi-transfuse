@@ -1,12 +1,15 @@
 # pi-transfuse
 
-Converts coding-agent sessions between **DeepSeek Harness** (DSH) and **Oh My Pi** (OMP / pi), in both directions, and imports **Claude Code** sessions into Pi, with a Ratatui browser for picking what to move.
+Converts coding-agent sessions between **DeepSeek Harness** (DSH) and **Oh My Pi** (OMP / pi), in both directions, and imports **Claude Code** sessions into Pi, with a Ratatui browser for picking what to move. It also archives sessions nobody has used in a while, either compressed in place or moved away to a backup store.
 
 ```
 pi-transfuse                        # browse and convert interactively
 pi-transfuse convert-all dsh        # migrate every DSH session into ~/.omp/agent/sessions
 pi-transfuse convert-all claude     # import every Claude Code session Pi does not already hold
 pi-transfuse verify                 # prove the conversions lose nothing
+pi-transfuse stale                  # sessions unused for 30 days and the space they hold
+pi-transfuse compact pack           # compress old sessions in place
+pi-transfuse vault push /Volumes/Backup/pi-vault   # move old sessions to a backup store
 ```
 
 ## Why it exists
@@ -83,6 +86,10 @@ pi-transfuse prune-empty [--filter TEXT] [--execute]
 pi-transfuse verify [dsh|pi|claude] [--filter TEXT] [--all]
 pi-transfuse export <id-or-path> [--format md|text] [-o FILE]
 pi-transfuse relocate <OLD_DIR> <NEW_DIR> [--dry-run] [--wait] [--move-dir]
+
+pi-transfuse stale [--older-than 30d] [--harness H]... [--filter TEXT] [--sort size|age|project] [--json]
+pi-transfuse compact list|pack|unpack …
+pi-transfuse vault init|info|list|push|pull|reindex <STORE> …
 ```
 
 `<id-or-path>` accepts a session-id prefix or a path to a session file; the direction is inferred from the source. Without `--out`, conversions write into the destination harness's real session root, so the result is immediately listed and resumable there. Claude Code sessions always land in Pi, and `--include-duplicates` imports one even when Pi already holds a copy.
@@ -100,6 +107,84 @@ A Claude Code session counts as empty when no model ever replied — it ran only
 `pi-transfuse relocate OLD NEW` moves every Pi session whose header `cwd` is `OLD` or lies under it (on a path-component boundary, so `OLD-other` never matches) to the bucket of the matching path under `NEW`, so `omp --resume` and `omp -c` in `NEW` find them without a re-root prompt. Each session moves as a unit — transcript, artifact directory, lock sidecar — with its header `cwd` and `additionalDirectories` remapped and the old path appended to `previousSessionFiles`; subagent transcripts get the same cwd rewrite. The title slot and every entry stay byte-identical. A failed step rolls the whole session back. Moves rename within a filesystem and otherwise copy, verify size and SHA-256, then delete.
 
 Sessions a running omp holds (`omp session lease`) are reported `held` and skipped; `--wait` polls until they are released. An existing destination is a `conflict`. Terminal breadcrumbs, custom session markers, `history.db` and `composer.db` are updated for moved sessions only (`sqlite3` must be on `PATH`). `--move-dir` renames `OLD` to `NEW` first and refuses a non-empty destination or a cross-filesystem rename; without it, `NEW` must exist. `--dry-run` prints the plan and writes nothing. Exit status: 0 when everything moved, 1 when any session was held, conflicting or failed, 2 on argument or environment errors. Re-running the same command finishes what is left.
+
+## Archiving old sessions
+
+Sessions and their artifact directories pile up. `stale` finds the ones nobody has touched in a while, and two command families get them out of the way:
+
+| | `compact` | `vault` |
+|---|---|---|
+| Archive goes | into the session's own bucket, beside where it lived | into a store folder you name: external disk, NAS mount, synced drive |
+| Local disk keeps | the compressed archive | nothing |
+| Brought back by | `compact unpack` | `vault pull <STORE>` |
+
+```sh
+pi-transfuse stale [--older-than 30d] [--harness pi|dsh|claude]... [--filter TEXT] [--sort size|age|project] [--json]
+
+pi-transfuse compact list   [--harness H]... [--filter TEXT] [--long | --json]
+pi-transfuse compact pack   [SESSION...] [--older-than 30d] [--harness H]... [--filter TEXT] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run]
+pi-transfuse compact unpack [SESSION|ARCHIVE...] [--harness H]... [--filter TEXT] [--keep] [--yes] [--dry-run]
+
+pi-transfuse vault init    <STORE> [--name NAME]
+pi-transfuse vault info    <STORE>
+pi-transfuse vault list    <STORE> [--harness H]... [--filter TEXT] [--long | --json]
+pi-transfuse vault push    <STORE> [SESSION...] [--older-than 30d] [--harness H]... [--filter TEXT] [--algo gzip|zstd] [--level N] [--threads N] [--keep] [--yes] [--dry-run]
+pi-transfuse vault pull    <STORE> [SESSION|ARCHIVE...] [--harness H]... [--filter TEXT] [--remove] [--yes] [--dry-run]
+pi-transfuse vault reindex <STORE>
+```
+
+A session is everything it owns: a Pi transcript with its artifact directory (subagent transcripts included) and lock sidecar; a DSH session directory with every log generation; a Claude Code transcript with its subagent directory. Its last use is the newest modification time among those paths. `--older-than` takes `30d`, `2w`, `36h`, or a bare number of days. `stale` lists the sessions past the threshold with their sizes and a per-project total, and changes nothing.
+
+Exit status of `compact` and `vault`: 0 when every chosen session went through, 1 when any was `held`, a `conflict`, `changed` while packing, or an `error`, 2 on argument or environment errors.
+
+### Choosing sessions
+
+Without session arguments, `pack`, `unpack`, `push` and `pull` open a picker on a terminal:
+
+| Key | Action |
+|---|---|
+| `space` | toggle the session under the cursor |
+| `a` / `A` | select every shown session / clear the selection |
+| `p` | toggle every shown session of the cursor's project |
+| `/` | filter by id, title, or project |
+| `[` / `]` | lower / raise the unused-for threshold through 0, 7, 15, 30, 60, 90, 180, 365 days |
+| `s` | sort oldest first, largest first, or by project |
+| `enter` | confirm the selection, or the session under the cursor |
+| `?` / `q` | keys / cancel |
+
+The detail pane shows everything known about the session under the cursor. A session that cannot be restored because a live copy exists is dimmed and cannot be selected. Naming sessions (an id, an id prefix, or an archive path) skips the picker and ignores the threshold, `--yes` takes every match past the threshold, and `--dry-run` prints the plan; off a terminal one of them is required.
+
+### Compression
+
+`--algo gzip` (the default; levels 0–9, default 6) writes `.tar.gz` that any `tar` opens. `--algo zstd` (levels −7 to 22, default 3) writes `.tar.zst`, compresses on every core (`--threads N` sets how many, `0` keeps it on one), and is faster and smaller at a comparable level; 19 and up are slow and the smallest. Higher levels cost time and CPU only when packing; unpacking is fast at any level. On the sessions measured here, a 16.2 MB Pi session packed to 1.6 MB at zstd 19 and to 4.1 MB at gzip 9. DSH logs are zstd-compressed already, so compacting them saves nothing; pushing them to a vault still frees all of it.
+
+### Archive format
+
+An archive is a tar stream of the session's paths relative to its harness root, opening with `.pi-transfuse/<name>.manifest.json` and closing with `.pi-transfuse/<name>.sha256.json`. The manifest records the harness, id, title, project, bucket, member paths, creation and last-use times, file count and size, subagents, message count when known, compression, and the harness root and machine (host, user, OS, architecture, tool version) it was packed on. The trailer holds the SHA-256 of every file.
+
+Packing writes the archive under a hidden temporary name, reads it back end to end against the sums, checks that the session did not change meanwhile (`changed` otherwise), and only then names the archive and removes the session. Pi sessions a running omp holds (`omp session lease`) are skipped as `held`; for DSH and Claude Code sessions the unchanged-files check is the guard. Restoring writes into a staging directory inside the bucket, checks every file against the sums, refuses any entry outside the session's paths or of a kind other than file and directory, never overwrites a session that exists (`conflict`), and puts back contents, permissions, and modification times. By hand: `tar -xf ARCHIVE -C ROOT --exclude .pi-transfuse`.
+
+### Compact
+
+`compact pack` replaces each chosen session with `<bucket>/<name>.tar.gz` (or `.tar.zst`) in the bucket it lived in. A packed session drops out of `omp --resume`, the browser, and the other commands until `compact unpack` restores it to the same paths and deletes the archive (`--keep` retains it). `compact list` shows every session packed in place; `--long` prints everything its manifest records, `--json` all of it for scripts.
+
+### Vault
+
+A store is any existing folder after `vault init`: a USB disk, a NAS mount, a Google Drive or Dropbox folder. Every store stands on its own:
+
+```
+<STORE>/
+  pi-transfuse-store.json                                  identity, history, every archive's manifest
+  archives/<harness>/<bucket>/<name>.<packed-at>.tar.gz    one per pushed session
+```
+
+The index records the store's name and id, its creation and last update with the machine behind each, and for every archive its manifest, size and SHA-256, when, from which machine and from which harness root it was pushed, and each restore since. `vault info` summarizes a store by harness, origin machine, and project; `vault list` lists its sessions (`--long` for everything, `--json` for scripts).
+
+`vault push` moves sessions into the store: live sessions pack straight into it, sessions already packed in place are copied as they are, and the local copy is removed once the store's copy checks out (`--keep` leaves it). Content the store already holds for that session is not stored twice. `vault pull` restores sessions to the paths they were packed from, under the current machine's harness root, and keeps the store's copy (`--remove` deletes it); naming a session pulls its newest copy. A session pushed, pulled, continued and pushed again keeps both copies, stamped with their pack times.
+
+The index caches what the archives themselves record and is written in batches during a push. `vault reindex` verifies every archive and rebuilds the index from them, keeping the push and restore history of archives it already knew and recovering the store's identity from the previous index generation when the current one is lost. Commands that change a store lock it against a concurrent run where the filesystem supports locks.
+
+Claude Code keeps more per-session state outside its projects directory (`file-history`, `todos`, `session-env`); archives hold the transcript and its subagents only.
 
 ## Mapping
 
@@ -192,6 +277,11 @@ src/claude_import.rs  Claude Code → Pi import
 src/dedup.rs          duplicate detection for Claude Code imports
 src/transcript.rs     readable projection shared by the preview and Markdown export
 src/tui.rs            Ratatui browser
+src/units.rs          sessions as on-disk units and their age; choosing and reporting shared by stale, compact, vault
+src/archive.rs        session archives: manifest, tar, gzip/zstd, read-back verification, staged restore
+src/compact.rs        compaction in place
+src/vault.rs          backup stores
+src/pick.rs           Ratatui multi-select picker
 src/main.rs           CLI
 ```
 

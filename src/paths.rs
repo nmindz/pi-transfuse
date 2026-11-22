@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::Side;
+
 /// Home directory, or `/` when the platform cannot report one.
 pub fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
@@ -60,6 +62,29 @@ pub fn claude_settings_file() -> PathBuf {
     match claude_config_dir() {
         Some(dir) => dir.join(".claude.json"),
         None => home().join(".claude.json"),
+    }
+}
+
+/// Session roots of every harness.
+#[derive(Debug, Clone)]
+pub struct Roots {
+    pub dsh: PathBuf,
+    pub pi: PathBuf,
+    pub claude: PathBuf,
+}
+
+impl Roots {
+    /// The roots the environment selects.
+    pub fn from_env() -> Roots {
+        Roots { dsh: dsh_root(), pi: pi_root(), claude: claude_root() }
+    }
+
+    pub fn of(&self, side: Side) -> &Path {
+        match side {
+            Side::Dsh => &self.dsh,
+            Side::Pi => &self.pi,
+            Side::Claude => &self.claude,
+        }
     }
 }
 

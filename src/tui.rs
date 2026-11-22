@@ -20,13 +20,13 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::transcript::{self, Speaker};
-use crate::{claude, clip, convert_one, dedup, dsh, paths, pi, shorten, Located, Side};
+use crate::{claude, clip, convert_one, dedup, dsh, human_size, paths, pi, shorten, Located, Side};
 
-const ACCENT: Color = Color::Rgb(0x5f, 0xd7, 0xff);
-const DIM: Color = Color::Rgb(0x80, 0x80, 0x80);
-const OK: Color = Color::Rgb(0x87, 0xd7, 0x87);
-const WARN: Color = Color::Rgb(0xff, 0xaf, 0x5f);
-const BAD: Color = Color::Rgb(0xff, 0x5f, 0x5f);
+pub(crate) const ACCENT: Color = Color::Rgb(0x5f, 0xd7, 0xff);
+pub(crate) const DIM: Color = Color::Rgb(0x80, 0x80, 0x80);
+pub(crate) const OK: Color = Color::Rgb(0x87, 0xd7, 0x87);
+pub(crate) const WARN: Color = Color::Rgb(0xff, 0xaf, 0x5f);
+pub(crate) const BAD: Color = Color::Rgb(0xff, 0x5f, 0x5f);
 
 /// Tab order; `tab` walks it forward and `shift-tab` backward.
 const SIDES: [Side; 3] = [Side::Dsh, Side::Pi, Side::Claude];
@@ -1316,24 +1316,8 @@ fn field(label: &str, value: &str) -> Line<'static> {
     ])
 }
 
-/// Byte count rendered for the detail pane.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 /// Centers a percentage-sized rectangle inside `area`.
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+pub(crate) fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1350,16 +1334,4 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn human_size_scales_to_the_right_unit() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2048), "2.0 KB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
-    }
 }

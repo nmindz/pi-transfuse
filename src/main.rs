@@ -4,16 +4,21 @@
 //! Running the binary with no subcommand opens the Ratatui browser; the
 //! subcommands expose the same conversions for scripts.
 
+mod archive;
 mod claude;
 mod claude_import;
+mod compact;
 mod convert;
 mod dedup;
 mod dsh;
 mod paths;
 mod pi;
+mod pick;
 mod relocate;
 mod transcript;
 mod tui;
+mod units;
+mod vault;
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +26,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Which harness a session belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     /// DeepSeek Harness.
     Dsh,
@@ -38,6 +44,15 @@ impl Side {
             Side::Dsh => Side::Pi,
             Side::Pi => Side::Dsh,
             Side::Claude => Side::Pi,
+        }
+    }
+
+    /// Short name used on the command line and in archives.
+    pub fn key(self) -> &'static str {
+        match self {
+            Side::Dsh => "dsh",
+            Side::Pi => "pi",
+            Side::Claude => "claude",
         }
     }
 }
@@ -172,6 +187,14 @@ enum Command {
         #[arg(long)]
         move_dir: bool,
     },
+    /// Find sessions unused for a while and the disk space they hold.
+    Stale(units::StaleArgs),
+    /// Pack old sessions into tarballs in place, and unpack them back.
+    #[command(subcommand)]
+    Compact(compact::Command),
+    /// Move old sessions away to a backup store folder, and bring them back.
+    #[command(subcommand)]
+    Vault(vault::Command),
 }
 
 fn main() -> Result<()> {
@@ -258,6 +281,21 @@ fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             }
+        }
+        Command::Stale(args) => units::stale(&units::Ctx::from_env(), &args),
+        Command::Compact(command) => exit_with(compact::run(&units::Ctx::from_env(), command)),
+        Command::Vault(command) => exit_with(vault::run(&units::Ctx::from_env(), command)),
+    }
+}
+
+/// Exits with a command's status: its own on success, 2 on an argument or
+/// environment error.
+fn exit_with(result: Result<i32>) -> ! {
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(2);
         }
     }
 }
@@ -1052,4 +1090,32 @@ pub fn clip(text: &str, width: usize) -> String {
     let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Byte count with a binary unit, for listings and the detail panes.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_scales_to_the_right_unit() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
 }
