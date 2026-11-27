@@ -121,14 +121,14 @@ Sessions a running omp holds (`omp session lease`) are reported `held` and skipp
 `migrate` moves OMP sessions between this machine and another over SSH: `pull` brings them here, `push` sends them there. Each session goes over as one archive in the [archive format](#archive-format) (zstd by default), is checked on arrival against the SHA-256 its sender computed and against the per-file sums inside, and is restored under the receiving host's Pi root into the bucket of its cwd, ready for `omp --resume` there.
 
 ```sh
-pi-transfuse migrate list <HOST> [FILTERS] [--sort KEY] [--reverse] [--long | --json] [SSH]
-pi-transfuse migrate pull <HOST> [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
-pi-transfuse migrate push <HOST> [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+pi-transfuse migrate list [HOST] [FILTERS] [--sort KEY] [--reverse] [--long | --json] [SSH]
+pi-transfuse migrate pull [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+pi-transfuse migrate push [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
 
 SSH: [--ssh PROGRAM] [--ssh-arg ARG]... [--remote-bin PATH]
 ```
 
-`<HOST>` is anything `ssh` accepts as a destination: `user@host`, or a `Host` from `~/.ssh/config`. The remote host needs the same pi-transfuse version; `migrate` starts `pi-transfuse migrate serve` there through `ssh -T` and speaks to it over that connection, so nothing listens on a port. `--remote-bin` names the remote binary when the remote `PATH` does not find it (`~/` expands to the remote home), `--ssh` picks another client, and each `--ssh-arg` is passed to it before the host (`--ssh-arg=-p --ssh-arg=2222`). Only OMP sessions migrate; `--include`/`--exclude harness=…` that leaves OMP out is an error.
+`<HOST>` is anything `ssh` accepts as a destination: `user@host`, or a `Host` from `~/.ssh/config`. Without a host, `migrate list`, `pull` and `push` open the browser on its [Remote tab](#remote-tab), asking for one, with `pull` or `push` preset; that needs a terminal. The remote host needs the same pi-transfuse version; `migrate` starts `pi-transfuse migrate serve` there through `ssh -T` and speaks to it over that connection, so nothing listens on a port. `--remote-bin` names the remote binary when the remote `PATH` does not find it (`~/` expands to the remote home), `--ssh` picks another client, and each `--ssh-arg` is passed to it before the host (`--ssh-arg=-p --ssh-arg=2222`). Only OMP sessions migrate; `--include`/`--exclude harness=…` that leaves OMP out is an error.
 
 `--delete` removes each session from the host it came from, only after the other host restored it with every checksum passing, and only when none of its files changed since it was packed and a running omp has not opened it (checked through `omp session lease` when `omp` is on that host's `PATH`); otherwise the session stays at its source and is reported as an `error` with the reason. Without `--delete` the source keeps its copy.
 

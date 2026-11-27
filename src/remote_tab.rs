@@ -127,6 +127,14 @@ impl RemoteTab {
         self.question.is_some()
     }
 
+    /// Opens on the host dialog, preset to pull or push.
+    pub fn open(&mut self, direction: Option<Direction>) {
+        if let Some(direction) = direction {
+            self.direction = direction;
+        }
+        self.input = Some(Input::Host { text: String::new(), pick: 0 });
+    }
+
     fn say(&mut self, text: impl Into<String>, color: Color) {
         self.log.push((text.into(), color));
     }

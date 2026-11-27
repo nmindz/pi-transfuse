@@ -37,7 +37,8 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Remote host: an ssh destination, `[user@]host` or a Host from ~/.ssh/config.
-    pub host: String,
+    /// Without it the browser opens on its Remote tab.
+    pub host: Option<String>,
     #[command(flatten)]
     pub scope: Scope,
     #[command(flatten)]
@@ -55,7 +56,8 @@ pub struct ListArgs {
 #[derive(Debug, Args)]
 pub struct MoveArgs {
     /// Remote host: an ssh destination, `[user@]host` or a Host from ~/.ssh/config.
-    pub host: String,
+    /// Without it the browser opens on its Remote tab.
+    pub host: Option<String>,
     #[command(flatten)]
     pub act: Act,
     #[command(flatten)]
@@ -91,11 +93,30 @@ pub fn streams(command: &Command) -> bool {
 
 pub fn run(ctx: &Ctx, command: Command) -> Result<i32> {
     match command {
-        Command::List(args) => list(ctx, &args),
-        Command::Pull(args) => migrate(ctx, &args, Direction::Pull),
-        Command::Push(args) => migrate(ctx, &args, Direction::Push),
+        Command::List(args) => match args.host.clone() {
+            Some(host) => list(ctx, &args, &host),
+            None => browse(None),
+        },
+        Command::Pull(args) => match args.host.clone() {
+            Some(host) => migrate(ctx, &args, &host, Direction::Pull),
+            None => browse(Some(Direction::Pull)),
+        },
+        Command::Push(args) => match args.host.clone() {
+            Some(host) => migrate(ctx, &args, &host, Direction::Push),
+            None => browse(Some(Direction::Push)),
+        },
         Command::Serve => wire::serve(ctx),
     }
+}
+
+/// The browser on its Remote tab, asking for a host; a terminal is required.
+pub fn browse(direction: Option<Direction>) -> Result<i32> {
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!("name a host: without one, migrate opens the browser, which needs a terminal");
+    }
+    crate::tui::run_remote(direction)?;
+    Ok(0)
 }
 
 fn only_omp(scope: &Scope) -> Result<()> {
@@ -105,9 +126,9 @@ fn only_omp(scope: &Scope) -> Result<()> {
     Ok(())
 }
 
-fn list(ctx: &Ctx, args: &ListArgs) -> Result<i32> {
+fn list(ctx: &Ctx, args: &ListArgs, host: &str) -> Result<i32> {
     only_omp(&args.scope)?;
-    let mut remote = Remote::connect(&args.host, &args.ssh, Launch::default())?;
+    let mut remote = Remote::connect(host, &args.ssh, Launch::default())?;
     let (units, held) = remote.list()?;
     let (host, root) = (remote.host.clone(), PathBuf::from(&remote.pi_root));
     drop(remote);
@@ -249,10 +270,10 @@ fn chosen_settings(settings: &[Setting]) -> (bool, Option<String>) {
     (delete, relocate)
 }
 
-fn migrate(ctx: &Ctx, args: &MoveArgs, direction: Direction) -> Result<i32> {
+fn migrate(ctx: &Ctx, args: &MoveArgs, host: &str, direction: Direction) -> Result<i32> {
     only_omp(&args.scope)?;
     let compression = args.compress.resolve(Algo::Zstd)?;
-    let mut remote = Remote::connect(&args.host, &args.ssh, Launch::default())?;
+    let mut remote = Remote::connect(host, &args.ssh, Launch::default())?;
     let mut outbox = Outbox::new(ctx);
     let mut inbox = Inbox::new(ctx);
     let plan = plan(ctx, &mut remote, &mut outbox, &mut inbox, direction)?;

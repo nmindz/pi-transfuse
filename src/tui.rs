@@ -657,13 +657,24 @@ impl App {
 /// Runs the browser until the user quits.
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal);
+    let result = event_loop(&mut terminal, App::new());
     ratatui::restore();
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
+/// Runs the browser opened on its Remote tab, asking for a host, for a bare
+/// `migrate` command; `direction` presets pull or push.
+pub fn run_remote(direction: Option<crate::migrate::Direction>) -> Result<()> {
     let mut app = App::new();
+    app.on_remote = true;
+    app.remote.open(direction);
+    let mut terminal = ratatui::init();
+    let result = event_loop(&mut terminal, app);
+    ratatui::restore();
+    result
+}
+
+fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     while !app.quit {
         app.remote.poll();
         // ssh waits on its question, whichever tab is showing.
