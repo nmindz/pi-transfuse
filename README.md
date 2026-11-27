@@ -10,6 +10,7 @@ pi-transfuse verify                 # prove the conversions lose nothing
 pi-transfuse stale                  # sessions unused for 30 days and the space they hold
 pi-transfuse compact pack           # compress old sessions in place
 pi-transfuse vault push /Volumes/Backup/pi-vault   # move old sessions to a backup store
+pi-transfuse migrate pull devbox --delete          # bring OMP sessions over from another machine
 ```
 
 ## Why it exists
@@ -90,6 +91,7 @@ pi-transfuse relocate <OLD_DIR> <NEW_DIR> [--dry-run] [--wait] [--move-dir]
 pi-transfuse stale [--older-than 30d] [--include|--exclude FIELD=VALUES]... [--filter TEXT] [--sort KEY] [--reverse] [--json]
 pi-transfuse compact list|pack|unpack|offload …
 pi-transfuse vault init|info|list|push|pull|reindex <STORE> …
+pi-transfuse migrate list|pull|push <HOST> …
 ```
 
 `<id-or-path>` accepts a session-id prefix or a path to a session file; the direction is inferred from the source. Without `--out`, conversions write into the destination harness's real session root, so the result is immediately listed and resumable there. Claude Code sessions always land in Pi, and `--include-duplicates` imports one even when Pi already holds a copy.
@@ -107,6 +109,28 @@ A Claude Code session counts as empty when no model ever replied — it ran only
 `pi-transfuse relocate OLD NEW` moves every Pi session whose header `cwd` is `OLD` or lies under it (on a path-component boundary, so `OLD-other` never matches) to the bucket of the matching path under `NEW`, so `omp --resume` and `omp -c` in `NEW` find them without a re-root prompt. Each session moves as a unit — transcript, artifact directory, lock sidecar — with its header `cwd` and `additionalDirectories` remapped and the old path appended to `previousSessionFiles`; subagent transcripts get the same cwd rewrite. The title slot and every entry stay byte-identical. A failed step rolls the whole session back. Moves rename within a filesystem and otherwise copy, verify size and SHA-256, then delete.
 
 Sessions a running omp holds (`omp session lease`) are reported `held` and skipped; `--wait` polls until they are released. An existing destination is a `conflict`. Terminal breadcrumbs, custom session markers, `history.db` and `composer.db` are updated for moved sessions only (`sqlite3` must be on `PATH`). `--move-dir` renames `OLD` to `NEW` first and refuses a non-empty destination or a cross-filesystem rename; without it, `NEW` must exist. `--dry-run` prints the plan and writes nothing. Exit status: 0 when everything moved, 1 when any session was held, conflicting or failed, 2 on argument or environment errors. Re-running the same command finishes what is left.
+
+### Migrating OMP sessions between hosts
+
+`migrate` moves OMP sessions between this machine and another over SSH: `pull` brings them here, `push` sends them there. Each session goes over as one archive in the [archive format](#archive-format) (zstd by default), is checked on arrival against the SHA-256 its sender computed and against the per-file sums inside, and is restored under the receiving host's Pi root into the bucket of its cwd, ready for `omp --resume` there.
+
+```sh
+pi-transfuse migrate list <HOST> [FILTERS] [--sort KEY] [--reverse] [--long | --json] [SSH]
+pi-transfuse migrate pull <HOST> [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+pi-transfuse migrate push <HOST> [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+
+SSH: [--ssh PROGRAM] [--ssh-arg ARG]... [--remote-bin PATH]
+```
+
+`<HOST>` is anything `ssh` accepts as a destination: `user@host`, or a `Host` from `~/.ssh/config`. The remote host needs the same pi-transfuse version; `migrate` starts `pi-transfuse migrate serve` there through `ssh -T` and speaks to it over that connection, so nothing listens on a port. `--remote-bin` names the remote binary when the remote `PATH` does not find it (`~/` expands to the remote home), `--ssh` picks another client, and each `--ssh-arg` is passed to it before the host (`--ssh-arg=-p --ssh-arg=2222`). Only OMP sessions migrate; `--include`/`--exclude harness=…` that leaves OMP out is an error.
+
+`--delete` removes each session from the host it came from, only after the other host restored it with every checksum passing, and only when none of its files changed since it was packed and a running omp has not opened it (checked through `omp session lease` when `omp` is on that host's `PATH`); otherwise the session stays at its source and is reported as an `error` with the reason. Without `--delete` the source keeps its copy.
+
+`--relocate DIR` is a built-in `relocate` for the arriving sessions: each is restored as if it had run in `DIR` on the receiving host, so its header `cwd` becomes `DIR`, `additionalDirectories` and subagent cwds under the old cwd move beneath `DIR`, and it lands in `DIR`'s bucket. `DIR` must exist on the receiving host, and `~` there is that host's home. Every other byte of the session stays as it was.
+
+Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. Sessions a running omp holds on the sending host, and sessions the receiving host already has, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are open there and which are already here.
+
+A broken connection stops the run with exit 2. The session in flight stays at its source, and a restore that did not finish leaves no partial session on the receiving host: archives arrive and unpack in a hidden `.pi-transfuse-migrate-*` directory beside the Pi root, removed when the run ends. Otherwise the exit status is that of `compact` and `vault`.
 
 ## Archiving old sessions
 

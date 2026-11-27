@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
@@ -43,7 +44,8 @@ impl Ctx {
 }
 
 /// One session as the paths it owns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Unit {
     pub harness: Side,
     pub id: String,
@@ -406,6 +408,17 @@ pub const HEADERS: [&str; 6] = ["unused", "size", "archive", "harness", "project
 /// ones; else, under `--yes` (or `--dry-run` off a terminal), every match old
 /// enough; else the user's picks. Cancelling picks nothing.
 pub fn choose(candidates: Vec<Candidate>, act: &Act, scope: &Scope, choice: Choice) -> Result<Vec<usize>> {
+    choose_with(candidates, act, scope, choice, &mut Vec::new())
+}
+
+/// [`choose`], letting the picker change `settings`; they come back as the user left them.
+pub fn choose_with(
+    candidates: Vec<Candidate>,
+    act: &Act,
+    scope: &Scope,
+    choice: Choice,
+    settings: &mut Vec<pick::Setting>,
+) -> Result<Vec<usize>> {
     let mut pool: Vec<(usize, Candidate)> =
         candidates.into_iter().enumerate().filter(|(_, c)| scope.admits(&c.row.facts)).collect();
     pool.sort_by(|(_, a), (_, b)| choice.sort.compare(&a.row.facts, &b.row.facts));
@@ -435,8 +448,13 @@ pub fn choose(candidates: Vec<Candidate>, act: &Act, scope: &Scope, choice: Choi
         threshold_days: choice.threshold.map(|age| age.days.round() as u32),
         sort: choice.sort,
         now_ms: choice.now_ms,
+        settings: settings.clone(),
     };
-    Ok(pick::pick(spec)?.map(|picked| picked.into_iter().map(|k| index[k]).collect()).unwrap_or_default())
+    let Some(picked) = pick::pick(spec)? else {
+        return Ok(Vec::new());
+    };
+    *settings = picked.settings;
+    Ok(picked.rows.into_iter().map(|k| index[k]).collect())
 }
 
 /// Candidates the user named: an archive path, or an id prefix that names one
@@ -677,6 +695,7 @@ pub enum Verb {
     Push,
     Pull,
     Offload,
+    Migrate,
 }
 
 impl Verb {
@@ -687,6 +706,7 @@ impl Verb {
             Verb::Push => "push",
             Verb::Pull => "pull",
             Verb::Offload => "offload",
+            Verb::Migrate => "migrate",
         }
     }
 
@@ -697,12 +717,14 @@ impl Verb {
             Verb::Push => "pushed",
             Verb::Pull => "pulled",
             Verb::Offload => "offloaded",
+            Verb::Migrate => "migrated",
         }
     }
 }
 
 /// What happened to one chosen session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Status {
     Done,
     Would,

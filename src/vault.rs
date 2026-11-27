@@ -628,7 +628,7 @@ enum Item<'a> {
 }
 
 fn push(ctx: &Ctx, args: &PushArgs) -> Result<i32> {
-    let compression = args.compress.resolve()?;
+    let compression = args.compress.resolve(archive::Algo::Gzip)?;
     let mut store = Store::open_locked(&args.store)?;
     let sides = args.scope.sides();
     let live = units::discover(&ctx.roots, &sides);
@@ -991,7 +991,7 @@ mod tests {
             scope: scope(),
             sort: sort(),
             older_than: "0d".parse().unwrap(),
-            compress: CompressArgs { algo: Algo::Zstd, level: Some(3), threads: Some(0) },
+            compress: CompressArgs { algo: Some(Algo::Zstd), level: Some(3), threads: Some(0) },
             keep: false,
         }
     }
@@ -1066,7 +1066,7 @@ mod tests {
             scope: scope(),
             sort: sort(),
             older_than: "0d".parse().unwrap(),
-            compress: CompressArgs { algo: Algo::Gzip, level: Some(1), threads: None },
+            compress: CompressArgs { algo: Some(Algo::Gzip), level: Some(1), threads: None },
         });
         compact::run(&ctx, pack).unwrap();
         let local = compact::discover(&ctx.roots, &[Side::Pi]).remove(0);
@@ -1120,7 +1120,7 @@ mod tests {
             scope: scope(),
             sort: sort(),
             older_than: "0d".parse().unwrap(),
-            compress: CompressArgs { algo: Algo::Gzip, level: Some(1), threads: None },
+            compress: CompressArgs { algo: Some(Algo::Gzip), level: Some(1), threads: None },
         });
         compact::run(&ctx, pack).unwrap();
         let offload_args = |store: PathBuf| OffloadArgs {

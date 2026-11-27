@@ -247,7 +247,7 @@ pub fn run(req: &Request, env: &Env) -> Result<Report> {
             }
         }
         let extra: Vec<&str> = olds.iter().map(String::as_str).collect();
-        item.status = match move_session(item, &extra, &new_str) {
+        item.status = match move_session(item, &extra, &new_str, true) {
             Ok(()) => {
                 if let Some(bucket) = item.old_path.parent() {
                     old_buckets.insert(bucket.to_path_buf());
@@ -300,6 +300,15 @@ fn absolute(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(out)
+}
+
+/// An existing directory as OMP records a cwd: absolute, symlinks resolved.
+pub(crate) fn existing_dir(path: &Path) -> Result<String> {
+    let abs = absolute(path)?;
+    if !abs.is_dir() {
+        bail!("{} is not an existing directory", abs.display());
+    }
+    path_str(&resolve(&abs))
 }
 
 /// Resolves symlinks in the deepest existing ancestor, as OMP does for a cwd.
@@ -405,10 +414,35 @@ enum Undo {
     Header { path: PathBuf, line: Vec<u8> },
 }
 
+/// Moves a session restored elsewhere, transcript `from` with its artifact
+/// directory and lock sidecar, to the transcript path `to`. `cwd` remaps the
+/// recorded directory from the first path to the second. Rolls back on failure.
+pub(crate) fn place(from: &Path, to: &Path, cwd: Option<(&str, &str)>) -> Result<()> {
+    let item = Item {
+        id: String::new(),
+        title: String::new(),
+        old_path: from.to_path_buf(),
+        new_path: to.to_path_buf(),
+        old_cwd: String::new(),
+        new_cwd: String::new(),
+        status: Status::WouldMove,
+    };
+    if conflicts(&item) {
+        let what = format!("{} or its artifacts already exist", to.display());
+        return Err(crate::archive::Refusal::Conflict(what).into());
+    }
+    let (olds, new) = match cwd {
+        Some((old, new)) => (vec![old], new),
+        None => (Vec::new(), ""),
+    };
+    move_session(&item, &olds, new, false)
+}
+
 /// Moves one session as a unit, rolling back every step when one fails.
-fn move_session(item: &Item, olds: &[&str], new: &str) -> Result<()> {
+/// `previous` records the old transcript path in the header.
+fn move_session(item: &Item, olds: &[&str], new: &str, previous: bool) -> Result<()> {
     let mut undo = Vec::new();
-    let result = move_steps(item, olds, new, &mut undo);
+    let result = move_steps(item, olds, new, previous, &mut undo);
     if result.is_err() {
         for step in undo.into_iter().rev() {
             let _ = match step {
@@ -421,7 +455,7 @@ fn move_session(item: &Item, olds: &[&str], new: &str) -> Result<()> {
     result
 }
 
-fn move_steps(item: &Item, olds: &[&str], new: &str, undo: &mut Vec<Undo>) -> Result<()> {
+fn move_steps(item: &Item, olds: &[&str], new: &str, previous: bool, undo: &mut Vec<Undo>) -> Result<()> {
     let bucket = item.new_path.parent().ok_or_else(|| anyhow!("destination has no bucket"))?;
     if !bucket.exists() {
         fs::create_dir_all(bucket).with_context(|| format!("create {}", bucket.display()))?;
@@ -446,9 +480,13 @@ fn move_steps(item: &Item, olds: &[&str], new: &str, undo: &mut Vec<Undo>) -> Re
         undo.push(Undo::Moved { from: old_lock, to: new_lock });
     }
 
-    let previous = path_str(&item.old_path)?;
+    if olds.is_empty() && !previous {
+        return Ok(());
+    }
+    let previous = previous.then(|| path_str(&item.old_path)).transpose()?;
     let line = rewrite_header(&item.new_path, |header| {
         rewrite_dirs(header, &remap_all);
+        let Some(previous) = previous else { return };
         let list = header
             .entry("previousSessionFiles")
             .or_insert_with(|| Value::Array(Vec::new()));

@@ -39,6 +39,58 @@ pub struct Spec {
     pub sort: Sort,
     /// Time ages are measured against.
     pub now_ms: i64,
+    /// Command settings the user can change before confirming.
+    pub settings: Vec<Setting>,
+}
+
+/// Value of one command setting the picker lets the user change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Flag(bool),
+    Text(String),
+}
+
+/// A command setting shown in the top bar and the confirm dialog.
+#[derive(Debug, Clone)]
+pub struct Setting {
+    /// Key that toggles a flag or opens the text editor; never one the picker already uses.
+    pub key: char,
+    pub label: String,
+    pub value: Value,
+    /// Shown in the warning color while a flag is on or a text is set (destructive or notable).
+    pub warn: bool,
+}
+
+impl Setting {
+    /// A flag that is on, or a text that is set.
+    fn active(&self) -> bool {
+        match &self.value {
+            Value::Flag(on) => *on,
+            Value::Text(text) => !text.is_empty(),
+        }
+    }
+
+    fn shown(&self) -> String {
+        match &self.value {
+            Value::Flag(on) => if *on { "on" } else { "off" }.to_string(),
+            Value::Text(text) if text.is_empty() => "—".to_string(),
+            Value::Text(text) => text.clone(),
+        }
+    }
+
+    fn style(&self, base: Style) -> Style {
+        if self.warn && self.active() {
+            base.fg(WARN)
+        } else {
+            base
+        }
+    }
+}
+
+/// What the user confirmed: row indices (ascending) and the settings as left.
+pub struct Picked {
+    pub rows: Vec<usize>,
+    pub settings: Vec<Setting>,
 }
 
 // Layout defaults and the unused-age preset ladder.
@@ -88,6 +140,9 @@ struct Picker {
     cursor: usize,
     filter: String,
     editing_filter: bool,
+    settings: Vec<Setting>,
+    /// Setting whose text is being edited, with the value to restore on Esc.
+    editing_setting: Option<(usize, String)>,
     overlay: Overlay,
     status: String,
     status_color: Color,
@@ -116,6 +171,8 @@ impl Picker {
             cursor: 0,
             filter: String::new(),
             editing_filter: false,
+            settings: spec.settings,
+            editing_setting: None,
             overlay: Overlay::None,
             status: String::new(),
             status_color: DIM,
@@ -359,6 +416,25 @@ impl Picker {
         }
         self.overlay = Overlay::Confirm;
     }
+
+    /// Flips the flag or opens the editor of the setting on `key`; false when none is.
+    fn press_setting(&mut self, key: char) -> bool {
+        let Some(i) = self.settings.iter().position(|s| s.key == key) else {
+            return false;
+        };
+        let setting = &mut self.settings[i];
+        match &mut setting.value {
+            Value::Flag(on) => *on = !*on,
+            Value::Text(text) => {
+                self.editing_setting = Some((i, text.clone()));
+                return true;
+            }
+        }
+        let msg = format!("{}: {}", setting.label, setting.shown());
+        let color = if setting.warn && setting.active() { WARN } else { DIM };
+        self.set_status(msg, color);
+        true
+    }
 }
 
 fn flip<T: Eq + std::hash::Hash>(set: &mut HashSet<T>, item: T) {
@@ -394,8 +470,8 @@ fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
     out
 }
 
-/// Confirmed row indices (ascending), or `None` if the user cancelled.
-pub fn pick(spec: Spec) -> Result<Option<Vec<usize>>> {
+/// The confirmed rows and settings, or `None` if the user cancelled.
+pub fn pick(spec: Spec) -> Result<Option<Picked>> {
     let mut terminal = ratatui::init();
     let result = run_picker(&mut terminal, spec);
     ratatui::restore();
@@ -403,7 +479,7 @@ pub fn pick(spec: Spec) -> Result<Option<Vec<usize>>> {
 }
 
 // Key handling; overlays eat keys before list mode sees them.
-fn run_picker(terminal: &mut DefaultTerminal, spec: Spec) -> Result<Option<Vec<usize>>> {
+fn run_picker(terminal: &mut DefaultTerminal, spec: Spec) -> Result<Option<Picked>> {
     let mut app = Picker::new(spec);
     while !app.cancelled && app.confirmed.is_none() {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -415,6 +491,8 @@ fn run_picker(terminal: &mut DefaultTerminal, spec: Spec) -> Result<Option<Vec<u
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             app.cancelled = true;
+        } else if app.editing_setting.is_some() {
+            setting_key(&mut app, key.code);
         } else if app.editing_filter {
             filter_key(&mut app, key.code);
         } else {
@@ -430,7 +508,33 @@ fn run_picker(terminal: &mut DefaultTerminal, spec: Spec) -> Result<Option<Vec<u
             }
         }
     }
-    Ok(if app.cancelled { None } else { app.confirmed })
+    if app.cancelled {
+        return Ok(None);
+    }
+    Ok(app.confirmed.map(|rows| Picked { rows, settings: app.settings }))
+}
+
+/// Text editor for one setting: Enter keeps the text, Esc restores the old one.
+fn setting_key(app: &mut Picker, code: KeyCode) {
+    let Some((i, previous)) = app.editing_setting.take() else {
+        return;
+    };
+    let Some(Value::Text(text)) = app.settings.get_mut(i).map(|s| &mut s.value) else {
+        return;
+    };
+    match code {
+        KeyCode::Esc => *text = previous,
+        KeyCode::Enter => {}
+        KeyCode::Backspace => {
+            text.pop();
+            app.editing_setting = Some((i, previous));
+        }
+        KeyCode::Char(c) => {
+            text.push(c);
+            app.editing_setting = Some((i, previous));
+        }
+        _ => app.editing_setting = Some((i, previous)),
+    }
 }
 
 fn filter_key(app: &mut Picker, code: KeyCode) {
@@ -490,6 +594,9 @@ fn list_key(app: &mut Picker, code: KeyCode) {
         KeyCode::Enter => app.request_confirm(),
         KeyCode::Char('?') => app.overlay = Overlay::Help,
         KeyCode::Char(c) => {
+            if app.press_setting(c) {
+                return;
+            }
             if let Some(key) = SortKey::ALL.into_iter().find(|k| k.key() == c) {
                 app.sort_by(key);
             }
@@ -529,22 +636,36 @@ fn draw(frame: &mut Frame, app: &Picker) {
 }
 
 fn draw_top(frame: &mut Frame, area: Rect, app: &Picker) {
-    let mut parts = vec![app.title.clone()];
-    if app.threshold_enabled {
-        parts.push(format!("unused ≥ {}d", app.threshold));
+    let base = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let mut parts = vec![(app.title.clone(), base)];
+    for (i, setting) in app.settings.iter().enumerate() {
+        let editing = matches!(app.editing_setting, Some((e, _)) if e == i);
+        let text = match &setting.value {
+            Value::Text(text) if editing => format!("{}: {text}▏", setting.label),
+            _ => format!("{}: {}", setting.label, setting.shown()),
+        };
+        parts.push((text, setting.style(base)));
     }
-    parts.push(app.sort.describe());
+    if app.threshold_enabled {
+        parts.push((format!("unused ≥ {}d", app.threshold), base));
+    }
+    parts.push((app.sort.describe(), base));
     if let Some(hiding) = app.hiding() {
-        parts.push(hiding);
+        parts.push((hiding, base));
     }
     if app.editing_filter {
-        parts.push(format!("/{}", app.filter));
+        parts.push((format!("/{}", app.filter), base));
     } else if !app.filter.is_empty() {
-        parts.push(format!("filter: {}", app.filter));
+        parts.push((format!("filter: {}", app.filter), base));
     }
-    let title = parts.join(" · ");
-    let line = Line::from(Span::styled(format!(" {title}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = vec![Span::styled(" ", base)];
+    for (n, (text, style)) in parts.into_iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::styled(" · ", base));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// First visible line that keeps `cursor` in the middle of `height` lines,
@@ -680,9 +801,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &Picker) {
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &Picker) {
     let (msg, color) = if app.status.is_empty() {
-        ("j/k move · space toggle · a all · / search · f filters · u s n d sort · enter confirm · q quit", DIM)
+        let mut hint = String::from("j/k move · space toggle · a all · / search · f filters · ");
+        hint.push_str("u s n d sort · enter confirm · q quit");
+        for setting in &app.settings {
+            hint.push_str(&format!(" · {} {}", setting.key, setting.label));
+        }
+        (hint, DIM)
     } else {
-        (app.status.as_str(), app.status_color)
+        (app.status.clone(), app.status_color)
     };
     frame.render_widget(Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(color)))), area);
 }
@@ -708,6 +834,13 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &Picker) {
     }
     for key in SortKey::ALL {
         rows.push((key.key().to_string(), format!("sort by {} (again to reverse)", key.label())));
+    }
+    for setting in &app.settings {
+        let verb = match setting.value {
+            Value::Flag(_) => "toggle",
+            Value::Text(_) => "edit",
+        };
+        rows.push((setting.key.to_string(), format!("{verb} {}", setting.label)));
     }
     rows.extend([("enter".into(), "confirm selection".into()), ("? / q".into(), "this help / cancel".into())]);
     let lines: Vec<Line> = rows
@@ -779,7 +912,9 @@ fn draw_filters(frame: &mut Frame, area: Rect, app: &Picker) {
 }
 
 fn draw_confirm(frame: &mut Frame, area: Rect, app: &Picker) {
-    let area = tui::centered(area, 60, 55);
+    let active: Vec<&Setting> = app.settings.iter().filter(|s| s.active()).collect();
+    let height = 55 + 5 * active.len().min(6) as u16;
+    let area = tui::centered(area, 60, height);
     frame.render_widget(Clear, area);
     let candidates = app.confirm_candidates();
     let total_bytes: u64 = candidates.iter().map(|&i| app.rows[i].facts.bytes).sum();
@@ -789,8 +924,12 @@ fn draw_confirm(frame: &mut Frame, area: Rect, app: &Picker) {
             format!("{} {} session(s) · {}?", app.verb, candidates.len(), human_size(total_bytes)),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
     ];
+    for setting in active {
+        let text = format!("{}: {}", setting.label, setting.shown());
+        lines.push(Line::from(Span::styled(text, setting.style(Style::default()))));
+    }
+    lines.push(Line::from(""));
     for &i in candidates.iter().take(10) {
         let row = &app.rows[i];
         let first = row.columns.first().map_or("—", String::as_str);
@@ -833,6 +972,10 @@ mod tests {
     }
 
     fn picker(rows: Vec<Row>, threshold: Option<u32>) -> Picker {
+        picker_with(rows, threshold, Vec::new())
+    }
+
+    fn picker_with(rows: Vec<Row>, threshold: Option<u32>, settings: Vec<Setting>) -> Picker {
         Picker::new(Spec {
             title: "test".into(),
             verb: "pack".into(),
@@ -841,7 +984,55 @@ mod tests {
             threshold_days: threshold,
             sort: Sort { key: SortKey::Used, reverse: false },
             now_ms: NOW,
+            settings,
         })
+    }
+
+    fn setting(key: char, label: &str, value: Value) -> Setting {
+        Setting { key, label: label.into(), value, warn: true }
+    }
+
+    #[test]
+    fn a_flag_key_flips_the_setting_and_reports_it() {
+        let delete = setting('D', "delete source", Value::Flag(false));
+        let mut p = picker_with(Vec::new(), None, vec![delete]);
+        list_key(&mut p, KeyCode::Char('D'));
+        assert_eq!(p.settings[0].value, Value::Flag(true));
+        assert_eq!((p.status.as_str(), p.status_color), ("delete source: on", WARN));
+        list_key(&mut p, KeyCode::Char('D'));
+        assert_eq!(p.settings[0].value, Value::Flag(false));
+        assert_eq!(p.status, "delete source: off");
+    }
+
+    #[test]
+    fn a_text_edit_is_kept_on_enter_and_restored_on_esc() {
+        let text = |p: &Picker| p.settings[0].value.clone();
+        let relocate = setting('R', "relocate to", Value::Text("/a".into()));
+        let mut p = picker_with(Vec::new(), None, vec![relocate]);
+        list_key(&mut p, KeyCode::Char('R'));
+        assert!(p.editing_setting.is_some());
+        setting_key(&mut p, KeyCode::Backspace);
+        setting_key(&mut p, KeyCode::Char('q'));
+        assert!(!p.cancelled, "keys go to the editor while editing");
+        setting_key(&mut p, KeyCode::Enter);
+        assert_eq!((text(&p), p.editing_setting.is_none()), (Value::Text("/q".into()), true));
+        list_key(&mut p, KeyCode::Char('R'));
+        setting_key(&mut p, KeyCode::Char('x'));
+        assert_eq!(text(&p), Value::Text("/qx".into()));
+        setting_key(&mut p, KeyCode::Esc);
+        assert_eq!((text(&p), p.editing_setting.is_none()), (Value::Text("/q".into()), true));
+    }
+
+    #[test]
+    fn a_setting_key_wins_over_a_sort_key() {
+        let mut p = picker_with(
+            vec![row(Side::Pi, "small", "/a", 90, 1, false), row(Side::Pi, "big", "/b", 1, 9, false)],
+            None,
+            vec![setting('s', "spare", Value::Flag(false))],
+        );
+        list_key(&mut p, KeyCode::Char('s'));
+        assert_eq!(p.settings[0].value, Value::Flag(true));
+        assert_eq!((p.sort.key, shown_ids(&p)), (SortKey::Used, vec!["small", "big"]));
     }
 
     fn shown_ids(p: &Picker) -> Vec<&str> {

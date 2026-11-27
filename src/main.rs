@@ -12,14 +12,17 @@ mod convert;
 mod dedup;
 mod dsh;
 mod facts;
+mod migrate;
 mod paths;
 mod pi;
 mod pick;
 mod relocate;
 mod transcript;
+mod transfer;
 mod tui;
 mod units;
 mod vault;
+mod wire;
 
 use std::path::{Path, PathBuf};
 
@@ -198,11 +201,18 @@ enum Command {
     /// Move old sessions away to a backup store folder, and bring them back.
     #[command(subcommand)]
     Vault(vault::Command),
+    /// Move OMP sessions between this host and another over SSH, optionally
+    /// relocating them and removing them where they came from.
+    #[command(subcommand)]
+    Migrate(migrate::Command),
 }
 
 fn main() -> Result<()> {
-    restore_default_sigpipe();
     let cli = Cli::parse();
+    // Streaming migrations need a closed pipe as an error they clean up after.
+    if !matches!(&cli.command, Some(Command::Migrate(command)) if migrate::streams(command)) {
+        restore_default_sigpipe();
+    }
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => tui::run(),
         Command::List { side, filter } => list(side, filter.as_deref()),
@@ -288,6 +298,7 @@ fn main() -> Result<()> {
         Command::Stale(args) => units::stale(&units::Ctx::from_env(), &args),
         Command::Compact(command) => exit_with(compact::run(&units::Ctx::from_env(), command)),
         Command::Vault(command) => exit_with(vault::run(&units::Ctx::from_env(), command)),
+        Command::Migrate(command) => exit_with(migrate::run(&units::Ctx::from_env(), command)),
     }
 }
 

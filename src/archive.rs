@@ -95,9 +95,9 @@ impl fmt::Display for Compression {
 /// Compression switches of the packing commands.
 #[derive(Debug, Args)]
 pub struct CompressArgs {
-    /// Compression algorithm.
-    #[arg(long, value_enum, default_value = "gzip")]
-    pub algo: Algo,
+    /// Compression algorithm: gzip (default for compact and vault) or zstd (default for migrate).
+    #[arg(long, value_enum)]
+    pub algo: Option<Algo>,
     /// Compression level; higher is smaller and slower. gzip 0-9 (default 6),
     /// zstd -7 to 22 (default 3; 19 and up are slow and very small).
     #[arg(long, allow_negative_numbers = true)]
@@ -108,23 +108,28 @@ pub struct CompressArgs {
 }
 
 impl CompressArgs {
-    pub fn resolve(&self) -> Result<Compression> {
-        let (min, max, default) = self.algo.levels();
-        let level = self.level.unwrap_or(default);
+    /// The chosen compression, `default` when no algorithm is named.
+    pub fn resolve(&self, default: Algo) -> Result<Compression> {
+        let algo = self.algo.unwrap_or(default);
+        let (min, max, fallback) = algo.levels();
+        let level = self.level.unwrap_or(fallback);
         if !(min..=max).contains(&level) {
-            bail!("{} levels run from {min} to {max}", self.algo.key());
+            bail!("{} levels run from {min} to {max}", algo.key());
         }
-        let threads = match self.algo {
+        let threads = match algo {
             Algo::Gzip if self.threads.is_some_and(|t| t > 1) => {
                 bail!("gzip compresses on one thread; --threads applies to --algo zstd")
             }
             Algo::Gzip => 0,
-            Algo::Zstd => self.threads.unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
-            }),
+            Algo::Zstd => self.threads.unwrap_or_else(all_cores),
         };
-        Ok(Compression { algo: self.algo, level, threads })
+        Ok(Compression { algo, level, threads })
     }
+}
+
+/// Every core this process may use.
+pub fn all_cores() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }
 
 /// Machine, user and tool behind a pack, push or restore.
@@ -293,10 +298,24 @@ pub fn pack(
     system: &System,
     now_ms: i64,
 ) -> Result<Archive> {
+    let nodes = units::walk(root, &unit.members)?;
+    pack_nodes(root, unit, &nodes, dest, compression, system, now_ms)
+}
+
+/// [`pack`] of the session as `nodes` found it; a session that no longer
+/// matches them by the end is refused as changed.
+pub fn pack_nodes(
+    root: &Path,
+    unit: &Unit,
+    nodes: &[Node],
+    dest: &Path,
+    compression: Compression,
+    system: &System,
+    now_ms: i64,
+) -> Result<Archive> {
     if dest.symlink_metadata().is_ok() {
         return Err(Refusal::Conflict(format!("{} exists", dest.display())).into());
     }
-    let nodes = units::walk(root, &unit.members)?;
     if let Some(odd) = nodes.iter().find(|n| n.kind == Kind::Other) {
         bail!("{} is neither a file nor a directory", odd.rel);
     }
@@ -312,7 +331,7 @@ pub fn pack(
         name: unit.name.clone(),
         members: unit.members.clone(),
         created: convert::iso(unit.created_ms),
-        last_used: convert::iso(units::last_used_ms(&nodes)),
+        last_used: convert::iso(units::last_used_ms(nodes)),
         packed_at: convert::iso(now_ms),
         files: files.len(),
         bytes: files.iter().map(|n| n.size).sum(),
@@ -328,7 +347,7 @@ pub fn pack(
     }
     let tmp = partial(dest);
     let result = (|| {
-        write(root, &nodes, &manifest, &tmp, compression)?;
+        write(root, nodes, &manifest, &tmp, compression)?;
         let checked = verify(&tmp)?;
         if units::walk(root, &unit.members)? != nodes {
             return Err(Refusal::Changed.into());
@@ -913,12 +932,12 @@ mod tests {
 
     #[test]
     fn level_ranges_follow_the_algorithm() {
-        let args = |algo, level, threads| CompressArgs { algo, level, threads };
-        assert_eq!(args(Algo::Gzip, None, None).resolve().unwrap().level, 6);
-        assert!(args(Algo::Gzip, Some(10), None).resolve().is_err());
-        assert_eq!(args(Algo::Zstd, Some(-7), Some(0)).resolve().unwrap().threads, 0);
-        assert!(args(Algo::Zstd, Some(23), None).resolve().is_err());
-        assert!(args(Algo::Gzip, None, Some(4)).resolve().is_err());
+        let args = |algo, level, threads| CompressArgs { algo: Some(algo), level, threads };
+        assert_eq!(args(Algo::Gzip, None, None).resolve(Algo::Gzip).unwrap().level, 6);
+        assert!(args(Algo::Gzip, Some(10), None).resolve(Algo::Gzip).is_err());
+        assert_eq!(args(Algo::Zstd, Some(-7), Some(0)).resolve(Algo::Gzip).unwrap().threads, 0);
+        assert!(args(Algo::Zstd, Some(23), None).resolve(Algo::Gzip).is_err());
+        assert!(args(Algo::Gzip, None, Some(4)).resolve(Algo::Gzip).is_err());
     }
 
     #[test]

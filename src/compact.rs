@@ -183,7 +183,7 @@ fn destination(root: &Path, unit: &Unit, extension: &str) -> PathBuf {
 }
 
 fn pack(ctx: &Ctx, args: &PackArgs) -> Result<i32> {
-    let compression = args.compress.resolve()?;
+    let compression = args.compress.resolve(archive::Algo::Gzip)?;
     let found = units::discover(&ctx.roots, &args.scope.sides());
     let candidates = found
         .iter()
@@ -302,7 +302,7 @@ mod tests {
             scope: scope(),
             sort: sort(),
             older_than: "0d".parse().unwrap(),
-            compress: CompressArgs { algo, level: None, threads: Some(0) },
+            compress: CompressArgs { algo: Some(algo), level: None, threads: Some(0) },
         }
     }
 
