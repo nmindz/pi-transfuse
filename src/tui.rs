@@ -19,6 +19,7 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::remote_tab::RemoteTab;
 use crate::transcript::{self, Speaker};
 use crate::{claude, clip, convert_one, dedup, dsh, human_size, paths, pi, shorten, Located, Side};
 
@@ -146,6 +147,9 @@ struct App {
     force: bool,
     include_empty: bool,
     quit: bool,
+    /// The Remote tab is showing instead of a harness tab.
+    on_remote: bool,
+    remote: RemoteTab,
 }
 
 impl App {
@@ -176,6 +180,8 @@ impl App {
             force: false,
             include_empty: false,
             quit: false,
+            on_remote: false,
+            remote: RemoteTab::new(),
         };
         app.refresh();
         app
@@ -383,20 +389,21 @@ impl App {
 
     /// Switches tabs and starts at the top of the new list.
     fn switch(&mut self, side: Side) {
+        self.on_remote = false;
         self.side = side;
         self.cursor = 0;
         self.reindex();
     }
 
-    /// Steps through the tabs, forward or backward.
+    /// Steps through the tabs, forward or backward; Remote follows Claude Code.
     fn cycle(&mut self, forward: bool) {
-        let at = SIDES.iter().position(|s| *s == self.side).unwrap_or(0);
-        let next = if forward {
-            (at + 1) % SIDES.len()
-        } else {
-            (at + SIDES.len() - 1) % SIDES.len()
-        };
-        self.switch(SIDES[next]);
+        let tabs = SIDES.len() + 1;
+        let at = if self.on_remote { SIDES.len() } else { SIDES.iter().position(|s| *s == self.side).unwrap_or(0) };
+        let next = if forward { (at + 1) % tabs } else { (at + tabs - 1) % tabs };
+        match SIDES.get(next) {
+            Some(&side) => self.switch(side),
+            None => self.on_remote = true,
+        }
     }
 
     /// Row under the cursor, when the cursor is on a session.
@@ -658,11 +665,33 @@ pub fn run() -> Result<()> {
 fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
     while !app.quit {
+        app.remote.poll();
+        // ssh waits on its question, whichever tab is showing.
+        if app.remote.asking() {
+            app.on_remote = true;
+            app.overlay = Overlay::None;
+            app.editing_filter = false;
+        }
+        for (text, color) in std::mem::take(&mut app.remote.log) {
+            app.say(text, color);
+        }
         terminal.draw(|frame| draw(frame, &mut app))?;
+        // Wakes to show what the Remote tab's connection reports meanwhile.
+        if !event::poll(std::time::Duration::from_millis(100))? {
+            continue;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            app.quit = true;
+            continue;
+        }
+        let overlay_free = matches!(app.overlay, Overlay::None) && !app.editing_filter;
+        if app.on_remote && overlay_free && app.remote.key(key) {
             continue;
         }
 
@@ -707,11 +736,16 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                     _ => app.say("import cancelled", DIM),
                 }
             }
+            // On the Remote tab only tab switching, help and quit remain here.
+            Overlay::None
+                if app.on_remote
+                    && !matches!(
+                        key.code,
+                        KeyCode::Char('q' | '?' | '1' | '2' | '3' | '4') | KeyCode::Tab | KeyCode::BackTab
+                    ) => {}
             Overlay::None => match key.code {
                 KeyCode::Char('q') => app.quit = true,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.quit = true
-                }
+                KeyCode::Char('4') => app.on_remote = true,
                 KeyCode::Tab => app.cycle(true),
                 KeyCode::BackTab => app.cycle(false),
                 KeyCode::Char('1') => app.switch(Side::Dsh),
@@ -803,12 +837,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_tabs(frame, chunks[0], app);
 
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(chunks[1]);
-    draw_list(frame, middle[0], app);
-    draw_detail(frame, middle[1], app);
+    if app.on_remote {
+        app.remote.draw(frame, chunks[1]);
+    } else {
+        let middle = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(chunks[1]);
+        draw_list(frame, middle[0], app);
+        draw_detail(frame, middle[1], app);
+    }
 
     draw_log(frame, chunks[2], app);
     draw_footer(frame, chunks[3], app);
@@ -826,8 +864,9 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!(" DSH · {} ", app.dsh_rows.len())),
         Line::from(format!(" Pi · {} ", app.pi_rows.len())),
         Line::from(format!(" Claude Code · {} ", app.claude_rows.len())),
+        Line::from(app.remote.tab_title()),
     ];
-    let index = SIDES.iter().position(|s| *s == app.side).unwrap_or(0);
+    let index = if app.on_remote { SIDES.len() } else { SIDES.iter().position(|s| *s == app.side).unwrap_or(0) };
     let flags = format!(
         "{}{}{}",
         if app.dry_run { " [dry-run]" } else { "" },
@@ -1125,7 +1164,9 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if app.editing_filter {
+    let text = if app.on_remote {
+        app.remote.footer()
+    } else if app.editing_filter {
         format!("filter: {}▏ (enter to apply, esc to clear)", app.filter)
     } else if app.side == Side::Claude {
         "tab switch · space check · ←/→ fold · a all · A none · x import checked · enter preview · m markdown · d dry-run · f overwrite · e empty · r rescan · ? help · q quit".to_string()
@@ -1257,10 +1298,10 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let area = centered(area, 64, 80);
+    let area = centered(area, 70, 90);
     frame.render_widget(Clear, area);
     let rows = [
-        ("tab / 1 2 3", "switch between DSH, Pi, and Claude Code"),
+        ("tab / 1 2 3 4", "switch between DSH, Pi, Claude Code, and Remote"),
         ("j k ↑ ↓", "move"),
         ("g G", "first / last"),
         ("space", "toggle selection; on a project, every shown session"),
@@ -1277,6 +1318,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("e", "show sessions that hold no conversation (hidden by default)"),
         ("r", "rescan every session root"),
         ("q", "quit"),
+        ("", ""),
+        ("Remote tab", ""),
+        ("c", "connect to a host (Host entries of ~/.ssh/config offered)"),
+        ("p", "switch between pull (here ← host) and push (here → host)"),
+        ("space a A /", "select, select all shown, clear, filter"),
+        ("D / R", "toggle delete-source / edit relocate-to directory"),
+        ("x", "migrate the selection after a confirmation; r relists"),
+        ("", "ssh's password, passphrase and host-key questions open a dialog"),
     ];
     let lines: Vec<Line> = rows
         .iter()

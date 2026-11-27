@@ -15,7 +15,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::{self, Algo, Compression, System};
-use crate::transfer::{self, Inbox, Meter, Outbox};
+use crate::askpass;
+use crate::transfer::{self, Inbox, Meter, Outbox, Progress};
 use crate::units::{Ctx, Status, Unit};
 
 /// Bumped whenever a message changes shape.
@@ -138,12 +139,36 @@ pub struct SshArgs {
     pub remote_bin: String,
 }
 
+impl Default for SshArgs {
+    /// What the browser uses: plain `ssh`, configured through `~/.ssh/config`,
+    /// and `PI_TRANSFUSE_REMOTE_BIN` naming the remote binary when set.
+    fn default() -> SshArgs {
+        let remote_bin = std::env::var("PI_TRANSFUSE_REMOTE_BIN").unwrap_or_else(|_| "pi-transfuse".into());
+        SshArgs { ssh: PathBuf::from("ssh"), ssh_arg: Vec::new(), remote_bin }
+    }
+}
+
 /// Quotes one word for the remote shell; a leading `~/` stays expandable.
 fn shell_word(word: &str) -> String {
     let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
     match word.strip_prefix("~/") {
         Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
         None => quote(word),
+    }
+}
+
+/// Starts ssh in a session of its own, without a controlling terminal, so it
+/// asks through askpass and never draws over the browser.
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe and touches only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -156,6 +181,18 @@ pub struct Terms {
     pub delete: bool,
 }
 
+/// Where ssh's questions, ssh's messages and transfer progress go; the
+/// terminal by default.
+#[derive(Default)]
+pub struct Launch {
+    /// Answers ssh's questions through this askpass socket, with ssh detached
+    /// from the terminal.
+    pub askpass: Option<PathBuf>,
+    /// Receives each line ssh writes to stderr.
+    pub stderr: Option<Box<dyn FnMut(String) + Send>>,
+    pub progress: Option<Box<Progress>>,
+}
+
 /// A `migrate serve` running on the remote host.
 pub struct Remote {
     pub host: String,
@@ -165,25 +202,32 @@ pub struct Remote {
     input: BufReader<ChildStdout>,
     /// `None` once closed, which ends the remote side.
     output: Option<BufWriter<ChildStdin>>,
+    progress: Option<Box<Progress>>,
 }
 
 impl Remote {
-    pub fn connect(host: &str, ssh: &SshArgs) -> Result<Remote> {
+    pub fn connect(host: &str, ssh: &SshArgs, launch: Launch) -> Result<Remote> {
         if host.is_empty() || host.starts_with('-') {
             bail!("{host:?} is not a host");
         }
         let command = format!("{} migrate serve", shell_word(&ssh.remote_bin));
-        let mut child = Command::new(&ssh.ssh)
-            .arg("-T")
-            .args(&ssh.ssh_arg)
-            .arg("--")
-            .arg(host)
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("run {}", ssh.ssh.display()))?;
+        let mut cmd = Command::new(&ssh.ssh);
+        cmd.arg("-T").args(&ssh.ssh_arg).arg("--").arg(host).arg(command);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        cmd.stderr(if launch.stderr.is_some() { Stdio::piped() } else { Stdio::inherit() });
+        if let Some(socket) = &launch.askpass {
+            let me = std::env::current_exe().context("locate this program for SSH_ASKPASS")?;
+            cmd.env("SSH_ASKPASS", me).env("SSH_ASKPASS_REQUIRE", "force").env(askpass::SOCKET_ENV, socket);
+            detach(&mut cmd);
+        }
+        let mut child = cmd.spawn().with_context(|| format!("run {}", ssh.ssh.display()))?;
+        if let (Some(mut sink), Some(stderr)) = (launch.stderr, child.stderr.take()) {
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    sink(line);
+                }
+            });
+        }
         let input = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("ssh has no stdout"))?);
         let output = BufWriter::new(child.stdin.take().ok_or_else(|| anyhow!("ssh has no stdin"))?);
         let mut remote = Remote {
@@ -193,6 +237,7 @@ impl Remote {
             child,
             input,
             output: Some(output),
+            progress: launch.progress,
         };
         match remote.greeting() {
             Ok((system, pi_root)) => {
@@ -205,8 +250,9 @@ impl Remote {
                 let _ = remote.child.kill();
                 let status = remote.child.wait().map(|s| format!(" ({s})")).unwrap_or_default();
                 Err(err.context(format!(
-                    "no migration service on {host}{status}: is pi-transfuse installed there? \
-                     --remote-bin names it when its PATH does not find it"
+                    "no migration service on {host}{status}: ssh's own message says why when it could \
+                     not log in; otherwise is pi-transfuse installed there? --remote-bin names it \
+                     when its PATH does not find it"
                 )))
             }
         }
@@ -272,7 +318,7 @@ impl Remote {
             other => return unexpected(other),
         };
         let received = {
-            let mut meter = Meter::new(id, size);
+            let mut meter = Meter::new(id, size, self.progress.as_deref_mut());
             inbox.receive(&mut self.input, size, &mut meter)?
         };
         if let Err(status) = inbox.settle(received, id, &sha256, terms.relocate.as_deref()) {
@@ -310,9 +356,9 @@ impl Remote {
         self.send(&accept)?;
         {
             let mut file = File::open(&offer.path).with_context(|| format!("open {}", offer.path.display()))?;
-            let mut meter = Meter::new(id, offer.size);
+            let mut meter = Meter::new(id, offer.size, self.progress.as_deref_mut());
             let host = self.host.clone();
-            let output = self.output()?;
+            let output = self.output.as_mut().ok_or_else(|| anyhow!("the connection is closed"))?;
             transfer::copy_exact(&mut file, output, offer.size, &mut meter)
                 .and_then(|_| output.flush().map_err(Into::into))
                 .with_context(|| format!("the connection to {host} broke"))?;

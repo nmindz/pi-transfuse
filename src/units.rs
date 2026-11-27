@@ -752,7 +752,7 @@ impl Status {
         matches!(self, Status::Done | Status::Would | Status::Stored)
     }
 
-    fn label(&self, verb: Verb) -> String {
+    pub(crate) fn label(&self, verb: Verb) -> String {
         match self {
             Status::Done => verb.past().to_string(),
             Status::Would => format!("would-{}", verb.present()),
@@ -764,7 +764,7 @@ impl Status {
         }
     }
 
-    fn reason(&self) -> Option<&str> {
+    pub(crate) fn reason(&self) -> Option<&str> {
         match self {
             Status::Conflict(why) | Status::Failed(why) => Some(why),
             Status::Held => Some("open in a running omp"),

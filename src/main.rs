@@ -5,6 +5,7 @@
 //! subcommands expose the same conversions for scripts.
 
 mod archive;
+mod askpass;
 mod claude;
 mod claude_import;
 mod compact;
@@ -17,6 +18,7 @@ mod paths;
 mod pi;
 mod pick;
 mod relocate;
+mod remote_tab;
 mod transcript;
 mod transfer;
 mod tui;
@@ -208,6 +210,14 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // ssh runs this program as SSH_ASKPASS for the browser's migrations, with
+    // the prompt as its only argument; a subcommand is never that.
+    if let Some(socket) = std::env::var_os(askpass::SOCKET_ENV) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.len() <= 1 && !args.iter().any(|a| a == "migrate") {
+            std::process::exit(askpass::client(std::path::Path::new(&socket)));
+        }
+    }
     let cli = Cli::parse();
     // Streaming migrations need a closed pipe as an error they clean up after.
     if !matches!(&cli.command, Some(Command::Migrate(command)) if migrate::streams(command)) {

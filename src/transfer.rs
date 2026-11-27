@@ -304,25 +304,29 @@ pub fn copy_exact(from: &mut dyn Read, to: &mut dyn Write, size: u64, meter: &mu
     Ok(archive::hex(&hasher.finalize()))
 }
 
-/// Transfer progress on stderr, redrawn in place at most ten times a
-/// second; silent off a terminal.
-pub struct Meter {
+/// Receives transfer progress: label, bytes done, bytes total.
+pub type Progress = dyn FnMut(&str, u64, u64) + Send;
+
+/// Transfer progress at most ten times a second: to `sink` when given, else
+/// redrawn in place on stderr when that is a terminal.
+pub struct Meter<'a> {
     label: String,
     total: u64,
     done: u64,
     start: Instant,
     drawn: Option<Instant>,
     on: bool,
+    sink: Option<&'a mut Progress>,
 }
 
-impl Meter {
-    pub fn new(label: &str, total: u64) -> Meter {
-        let on = io::stderr().is_terminal();
-        Meter { label: crate::clip(label, 40), total, done: 0, start: Instant::now(), drawn: None, on }
+impl<'a> Meter<'a> {
+    pub fn new(label: &str, total: u64, sink: Option<&'a mut Progress>) -> Meter<'a> {
+        let on = sink.is_some() || io::stderr().is_terminal();
+        Meter { label: crate::clip(label, 40), total, done: 0, start: Instant::now(), drawn: None, on, sink }
     }
 
-    pub fn off() -> Meter {
-        Meter { label: String::new(), total: 0, done: 0, start: Instant::now(), drawn: None, on: false }
+    pub fn off() -> Meter<'static> {
+        Meter { label: String::new(), total: 0, done: 0, start: Instant::now(), drawn: None, on: false, sink: None }
     }
 
     fn add(&mut self, n: u64) {
@@ -335,6 +339,10 @@ impl Meter {
             return;
         }
         self.drawn = Some(now);
+        if let Some(sink) = self.sink.as_mut() {
+            sink(&self.label, self.done, self.total);
+            return;
+        }
         let secs = (now - self.start).as_secs_f64().max(0.001);
         let rate = (self.done as f64 / secs) as u64;
         let percent = self.done.saturating_mul(100).checked_div(self.total).unwrap_or(100);
@@ -348,9 +356,9 @@ impl Meter {
     }
 }
 
-impl Drop for Meter {
+impl Drop for Meter<'_> {
     fn drop(&mut self) {
-        if self.on && self.drawn.is_some() {
+        if self.on && self.sink.is_none() && self.drawn.is_some() {
             eprint!("\r\x1b[2K");
         }
     }

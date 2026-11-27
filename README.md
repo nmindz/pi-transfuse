@@ -44,7 +44,7 @@ Session roots are discovered from `~/.dsh`, `~/.omp`, and `~/.claude`, overridab
 
 | Key | Action |
 |---|---|
-| `tab`, `1`, `2`, `3` | switch between the DSH, Pi, and Claude Code session lists |
+| `tab`, `1`, `2`, `3`, `4` | switch between the DSH, Pi, Claude Code, and [Remote](#remote-tab) tabs |
 | `j` `k` `↑` `↓`, `g` `G`, `PgUp` `PgDn` | move |
 | `space` | toggle selection; on a Claude Code project, every shown session in it |
 | `a` / `A` | select everything shown / clear the selection |
@@ -60,6 +60,12 @@ Session roots are discovered from `~/.dsh`, `~/.omp`, and `~/.claude`, overridab
 | `?` / `q` | keys / quit |
 
 The detail pane shows where a session would land and warns when that file already exists.
+
+### Remote tab
+
+The fourth tab runs [`migrate`](#migrating-omp-sessions-between-hosts) against another host. `c` (or `enter` while disconnected) asks for a host, offering every concrete `Host` of `~/.ssh/config` as you type; the tab then lists the OMP sessions on the sending side, which `p` switches between the remote host (pull) and this one (push). `space`, `a`, `A` and `/` select and filter as elsewhere, `D` toggles delete-source and `R` sets the directory to relocate into on the receiving host, both shown under the list. `x` asks for confirmation and migrates the selection, or the session under the cursor, with transfer progress in the detail pane and one line per session in the activity log; `r` lists again. Sessions open in a running omp on the sending side, or already on the receiving side, are dimmed.
+
+When ssh needs a password, a key passphrase or a decision on an unknown host key, a dialog shows its question whichever tab is open: typing stays hidden for passwords and passphrases, `enter` answers and `esc` declines. The browser starts ssh detached from the terminal with itself as `SSH_ASKPASS`, so ssh's prompts and messages never draw over the screen; its messages land in the activity log. The tab uses plain `ssh` with `~/.ssh/config` for everything else, and `PI_TRANSFUSE_REMOTE_BIN` names pi-transfuse on the remote host when its `PATH` does not find it there.
 
 ### Claude Code tab
 
@@ -128,7 +134,9 @@ SSH: [--ssh PROGRAM] [--ssh-arg ARG]... [--remote-bin PATH]
 
 `--relocate DIR` is a built-in `relocate` for the arriving sessions: each is restored as if it had run in `DIR` on the receiving host, so its header `cwd` becomes `DIR`, `additionalDirectories` and subagent cwds under the old cwd move beneath `DIR`, and it lands in `DIR`'s bucket. `DIR` must exist on the receiving host, and `~` there is that host's home. Every other byte of the session stays as it was.
 
-Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. Sessions a running omp holds on the sending host, and sessions the receiving host already has, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are open there and which are already here.
+Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. Sessions a running omp holds on the sending host, and sessions the receiving host already has, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are open there and which are already here. The browser's [Remote tab](#remote-tab) does the same interactively.
+
+Authentication is OpenSSH's own: keys, ssh-agent and `~/.ssh/config` apply exactly as for `ssh <HOST>`, so a key per host is an `IdentityFile` under its `Host` entry (or `--ssh-arg=-i --ssh-arg=KEY` for one run). On the command line ssh asks for a password, a key passphrase or a new host key in the terminal, before the picker opens; without a terminal only key or agent authentication works, and `--ssh-arg=-oBatchMode=yes` makes a missing key fail at once instead of waiting.
 
 A broken connection stops the run with exit 2. The session in flight stays at its source, and a restore that did not finish leaves no partial session on the receiving host: archives arrive and unpack in a hidden `.pi-transfuse-migrate-*` directory beside the Pi root, removed when the run ends. Otherwise the exit status is that of `compact` and `vault`.
 

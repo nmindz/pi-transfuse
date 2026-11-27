@@ -14,7 +14,7 @@ use crate::facts::{Facts, Scope, SortArgs, SortKey};
 use crate::pick::{Setting, Value};
 use crate::transfer::{Inbox, Outbox};
 use crate::units::{self, Act, Candidate, Choice, Ctx, Report, Status, Unit, Verb};
-use crate::wire::{self, Remote, SshArgs, Terms};
+use crate::wire::{self, Launch, Remote, SshArgs, Terms};
 use crate::{human_size, Side};
 
 const DELETE_KEY: char = 'D';
@@ -78,7 +78,7 @@ pub struct MoveArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+pub enum Direction {
     Pull,
     Push,
 }
@@ -107,7 +107,7 @@ fn only_omp(scope: &Scope) -> Result<()> {
 
 fn list(ctx: &Ctx, args: &ListArgs) -> Result<i32> {
     only_omp(&args.scope)?;
-    let mut remote = Remote::connect(&args.host, &args.ssh)?;
+    let mut remote = Remote::connect(&args.host, &args.ssh, Launch::default())?;
     let (units, held) = remote.list()?;
     let (host, root) = (remote.host.clone(), PathBuf::from(&remote.pi_root));
     drop(remote);
@@ -163,17 +163,17 @@ fn state(unit: &Unit, held: &HashSet<String>, here: &HashSet<String>, host: &str
 }
 
 /// The sessions on the sending host, and what blocks them.
-struct Plan {
-    sources: Vec<Unit>,
-    root: PathBuf,
+pub struct Plan {
+    pub sources: Vec<Unit>,
+    pub root: PathBuf,
     held: HashSet<String>,
     /// Ids the receiving host already has.
     present: HashSet<String>,
-    from: String,
-    to: String,
+    pub from: String,
+    pub to: String,
 }
 
-fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inbox, direction: Direction) -> Result<Plan> {
+pub fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inbox, direction: Direction) -> Result<Plan> {
     let (remote_units, remote_held) = remote.list()?;
     let host = remote.host.clone();
     Ok(match direction {
@@ -201,7 +201,7 @@ fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inbox, 
 }
 
 impl Plan {
-    fn blocked(&self, unit: &Unit) -> Option<Status> {
+    pub fn blocked(&self, unit: &Unit) -> Option<Status> {
         if self.held.contains(&unit.id) {
             Some(Status::Held)
         } else if self.present.contains(&unit.id) {
@@ -211,7 +211,7 @@ impl Plan {
         }
     }
 
-    fn candidate(&self, unit: &Unit, now_ms: i64) -> Candidate {
+    pub fn candidate(&self, unit: &Unit, now_ms: i64) -> Candidate {
         let mut row = units::unit_row(unit, &self.root, now_ms);
         row.details.insert(0, ("host".into(), self.from.clone()));
         row.blocked = match self.blocked(unit) {
@@ -252,7 +252,7 @@ fn chosen_settings(settings: &[Setting]) -> (bool, Option<String>) {
 fn migrate(ctx: &Ctx, args: &MoveArgs, direction: Direction) -> Result<i32> {
     only_omp(&args.scope)?;
     let compression = args.compress.resolve(Algo::Zstd)?;
-    let mut remote = Remote::connect(&args.host, &args.ssh)?;
+    let mut remote = Remote::connect(&args.host, &args.ssh, Launch::default())?;
     let mut outbox = Outbox::new(ctx);
     let mut inbox = Inbox::new(ctx);
     let plan = plan(ctx, &mut remote, &mut outbox, &mut inbox, direction)?;
@@ -312,14 +312,24 @@ fn migrate(ctx: &Ctx, args: &MoveArgs, direction: Direction) -> Result<i32> {
 /// resolved on the receiving host.
 fn terms(settings: &[Setting], direction: Direction, remote: &mut Remote, compression: Compression) -> Result<Terms> {
     let (delete, relocate) = chosen_settings(settings);
-    let relocate = match relocate {
-        None => None,
-        Some(dir) => Some(match direction {
-            Direction::Pull => Inbox::target(&dir)?,
-            Direction::Push => remote.target(&dir)?,
-        }),
-    };
+    let relocate = relocate.map(|dir| target(&dir, direction, remote)).transpose()?;
     Ok(Terms { compression, relocate, delete })
+}
+
+/// A relocation directory resolved on the receiving host.
+pub fn target(dir: &str, direction: Direction, remote: &mut Remote) -> Result<String> {
+    match direction {
+        Direction::Pull => Inbox::target(dir),
+        Direction::Push => remote.target(dir),
+    }
+}
+
+/// Migrates one session; an `Err` broke the connection.
+pub fn one(remote: &mut Remote, direction: Direction, id: &str, terms: &Terms, inbox: &mut Inbox, outbox: &mut Outbox) -> Result<(Status, u64)> {
+    match direction {
+        Direction::Pull => remote.fetch(id, terms, inbox),
+        Direction::Push => remote.deliver(id, terms, outbox),
+    }
 }
 
 fn describe(plan: &Plan, terms: &Terms) -> String {
