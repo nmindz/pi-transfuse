@@ -79,20 +79,30 @@ impl Hosts {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let output = Command::new(BIN)
+        let output = self
+            .command(args, "ssh")
+            .args(["--remote-bin", BIN])
+            .output()
+            .unwrap();
+        eprintln!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        output
+    }
+
+    /// This program in the local host's environment, reaching the remote one
+    /// through the fake ssh `ssh` in `bin`.
+    fn command(&self, args: &[&str], ssh: &str) -> Command {
+        let mut command = Command::new(BIN);
+        command
             .args(args)
-            .args(["--ssh", self.dir.join("bin/ssh").to_str().unwrap(), "--remote-bin", BIN])
+            .args(["--ssh", self.dir.join("bin").join(ssh).to_str().unwrap()])
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", self.dir.join("bin").display()))
             .env("HOME", self.dir.join("home"))
             .env("TMPDIR", self.dir.join("tmp"))
             .env("OMP_HOME", self.dir.join("local"))
             .env("REMOTE_OMP_HOME", self.dir.join("remote"))
-            .env("HELD_FILE", self.dir.join("held.json"))
-            .output()
-            .unwrap();
-        eprintln!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        output
+            .env("HELD_FILE", self.dir.join("held.json"));
+        command
     }
 
     /// No staging directory left on either host.
@@ -201,4 +211,49 @@ fn a_session_open_at_the_source_stays_put() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("held"));
     assert_eq!(files(&hosts.sessions("remote")), remote);
     assert!(files(&hosts.sessions("local")).is_empty());
+}
+
+/// As sshd does: the login shell runs the command with `-c`, in a bare
+/// environment, so only rc files a non-interactive shell reads apply.
+#[test]
+fn the_remote_binary_is_found_through_the_login_shells_rc_files() {
+    let hosts = Hosts::new();
+    let cwd = hosts.work("proj");
+    hosts.session("remote", "s4", &cwd);
+    let (rhome, rcbin, mark) = (hosts.dir.join("rhome"), hosts.dir.join("rcbin"), hosts.dir.join("found"));
+    fs::create_dir_all(rhome.join(".config/fish")).unwrap();
+    fs::create_dir_all(&rcbin).unwrap();
+    script(&rcbin.join("pi-transfuse"), &format!("#!/bin/sh\ntouch '{}'\nexec '{BIN}' \"$@\"\n", mark.display()));
+    let rc = rcbin.display();
+    fs::write(rhome.join(".zshrc"), format!("echo rc noise\npath=({rc} $path)\n")).unwrap();
+    fs::write(rhome.join(".bashrc"), format!("echo rc noise\nPATH={rc}:$PATH\n")).unwrap();
+    fs::write(rhome.join(".bash_profile"), ". ~/.bashrc\n").unwrap();
+    fs::write(rhome.join(".config/fish/config.fish"), format!("set -gx PATH {rc} $PATH\n")).unwrap();
+    script(
+        &hosts.dir.join("bin/sshd"),
+        &format!(
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift 2\n\
+             exec env -i HOME='{}' PATH=/usr/bin:/bin SHELL=\"$LOGIN\" OMP_HOME=\"$REMOTE_OMP_HOME\" \
+             HELD_FILE=\"$HELD_FILE\" \"$LOGIN\" -c \"$1\"\n",
+            rhome.display()
+        ),
+    );
+    let mut tried = 0;
+    for shell in ["/bin/zsh", "/bin/bash", "/opt/homebrew/bin/fish", "/usr/bin/fish", "/bin/tcsh"] {
+        if !Path::new(shell).exists() {
+            continue;
+        }
+        tried += 1;
+        let _ = fs::remove_file(&mark);
+        let out = hosts.command(&["migrate", "list", "box", "--json"], "sshd").env("LOGIN", shell).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("\"s4\""), "{shell}: {stdout}");
+        // tcsh cannot be an interactive login shell under -c; the install
+        // folders and this program's own path stand in for its rc files.
+        if !shell.ends_with("tcsh") {
+            assert!(mark.exists(), "{shell} did not run pi-transfuse from the rc PATH");
+        }
+    }
+    assert!(tried >= 2);
 }

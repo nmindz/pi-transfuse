@@ -134,27 +134,90 @@ pub struct SshArgs {
     /// Extra argument for ssh, before the host; repeat for more (`--ssh-arg=-p --ssh-arg=2222`).
     #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
     pub ssh_arg: Vec<String>,
-    /// pi-transfuse on the remote host, when its PATH does not find it there.
-    #[arg(long, value_name = "PATH", default_value = "pi-transfuse")]
-    pub remote_bin: String,
+    /// pi-transfuse on the remote host; found through your login shell's PATH
+    /// there, then the usual install folders, when omitted.
+    #[arg(long, value_name = "PATH")]
+    pub remote_bin: Option<String>,
 }
 
 impl Default for SshArgs {
-    /// What the browser uses: plain `ssh`, configured through `~/.ssh/config`,
-    /// and `PI_TRANSFUSE_REMOTE_BIN` naming the remote binary when set.
+    /// What the browser uses: plain `ssh`, configured through `~/.ssh/config`.
     fn default() -> SshArgs {
-        let remote_bin = std::env::var("PI_TRANSFUSE_REMOTE_BIN").unwrap_or_else(|_| "pi-transfuse".into());
-        SshArgs { ssh: PathBuf::from("ssh"), ssh_arg: Vec::new(), remote_bin }
+        SshArgs { ssh: PathBuf::from("ssh"), ssh_arg: Vec::new(), remote_bin: None }
     }
 }
 
-/// Quotes one word for the remote shell; a leading `~/` stays expandable.
-fn shell_word(word: &str) -> String {
-    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
-    match word.strip_prefix("~/") {
-        Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
-        None => quote(word),
+/// Where pi-transfuse is looked for on the remote host after the login
+/// shell's PATH, `$HOME` expanded there.
+const INSTALL_DIRS: [&str; 4] = ["$HOME/.local/bin", "$HOME/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin"];
+
+/// True for text that stays itself inside double quotes in a POSIX shell and
+/// inside single quotes in every login shell ssh may hand the command to.
+fn plain(text: &str) -> bool {
+    !text.is_empty() && !text.contains(['\'', '"', '\\', '$', '`', '!', '\n', '\r'])
+}
+
+/// A path as a double-quoted POSIX word; a leading `~/` becomes `$HOME/`.
+fn remote_path(path: &str) -> Option<String> {
+    let path = path.strip_prefix("~/").map_or_else(|| path.to_string(), |rest| format!("$HOME/{rest}"));
+    let rest = path.strip_prefix("$HOME/").unwrap_or(&path);
+    plain(rest).then(|| format!("\"{path}\""))
+}
+
+/// The command ssh runs on the remote host. ssh hands it to the user's login
+/// shell non-interactively, which on most setups skips the rc files that set
+/// PATH. So it asks that shell, as an interactive login shell, for its PATH,
+/// then finds pi-transfuse on it or in the install folders, and runs
+/// `migrate serve` with that PATH, which also lets serve find `omp`.
+///
+/// The script is one line of POSIX sh inside single quotes, with no single
+/// quote, backslash or `!`, so bash, zsh, fish and tcsh all pass it intact.
+/// The probe gets no stdin, so an rc file that reads input cannot eat the
+/// protocol, and the PATH is taken from its last output line.
+fn remote_command(remote_bin: Option<&str>, local_exe: Option<&str>) -> Result<String> {
+    let home = crate::paths::home();
+    let same_place = local_exe.and_then(|exe| match std::path::Path::new(exe).strip_prefix(&home) {
+        Ok(rest) => remote_path(&format!("~/{}", rest.display())),
+        Err(_) => remote_path(exe),
+    });
+    let mut find = String::new();
+    match remote_bin {
+        Some(bin) if !bin.contains('/') => {
+            if !plain(bin) {
+                bail!("--remote-bin {bin:?} has characters that cannot pass through every remote shell");
+            }
+            find.push_str(&format!("b=$(command -v \"{bin}\" 2>/dev/null); "));
+        }
+        Some(bin) => {
+            let word = remote_path(bin).ok_or_else(|| {
+                anyhow!("--remote-bin {bin:?} has characters that cannot pass through every remote shell")
+            })?;
+            find.push_str(&format!("b={word}; [ -x \"$b\" ] || b=; "));
+        }
+        None => {
+            find.push_str("b=$(command -v pi-transfuse 2>/dev/null); ");
+            let candidates: Vec<String> = same_place
+                .into_iter()
+                .chain(INSTALL_DIRS.iter().map(|dir| format!("\"{dir}/pi-transfuse\"")))
+                .collect();
+            find.push_str(&format!(
+                "for c in {}; do [ -n \"$b\" ] && break; [ -x \"$c\" ] && b=\"$c\"; done; ",
+                candidates.join(" ")
+            ));
+        }
     }
+    let wanted = remote_bin.unwrap_or("pi-transfuse");
+    let script = format!(
+        "p=$(\"${{SHELL:-/bin/sh}}\" -lic \"printenv PATH\" </dev/null 2>/dev/null | tail -n 1); \
+         case \"$p\" in /*) PATH=\"$p:$PATH\"; export PATH;; esac; \
+         {find}\
+         [ -n \"$b\" ] || {{ echo \"{wanted} was not found on $(hostname): not on the PATH of \
+         ${{SHELL:-sh}} as a login shell, nor in the usual install folders; install it there \
+         or name it with --remote-bin\" >&2; exit 127; }}; \
+         exec \"$b\" migrate serve"
+    );
+    debug_assert!(!script.contains(['\'', '\\', '!', '\n']));
+    Ok(format!("exec /bin/sh -c '{script}'"))
 }
 
 /// Starts ssh in a session of its own, without a controlling terminal, so it
@@ -210,7 +273,9 @@ impl Remote {
         if host.is_empty() || host.starts_with('-') {
             bail!("{host:?} is not a host");
         }
-        let command = format!("{} migrate serve", shell_word(&ssh.remote_bin));
+        let remote_bin = ssh.remote_bin.clone().or_else(|| std::env::var("PI_TRANSFUSE_REMOTE_BIN").ok());
+        let local_exe = std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string));
+        let command = remote_command(remote_bin.as_deref(), local_exe.as_deref())?;
         let mut cmd = Command::new(&ssh.ssh);
         cmd.arg("-T").args(&ssh.ssh_arg).arg("--").arg(host).arg(command);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -250,9 +315,8 @@ impl Remote {
                 let _ = remote.child.kill();
                 let status = remote.child.wait().map(|s| format!(" ({s})")).unwrap_or_default();
                 Err(err.context(format!(
-                    "no migration service on {host}{status}: ssh's own message says why when it could \
-                     not log in; otherwise is pi-transfuse installed there? --remote-bin names it \
-                     when its PATH does not find it"
+                    "no migration service on {host}{status}: ssh's own message above says why \
+                     when it could not log in or find pi-transfuse there"
                 )))
             }
         }
