@@ -1120,9 +1120,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(""),
                 Line::from(Span::styled(
                     match row.side {
-                        Side::Dsh => "converts to Pi",
-                        Side::Pi => "converts to DSH",
-                        Side::Claude => "imports to Pi",
+                        Side::Dsh => "x converts it to Pi (another harness, this host)",
+                        Side::Pi => "x converts it to DSH (another harness, this host; the Remote tab migrates OMP → OMP)",
+                        Side::Claude => "x imports it into Pi",
                     },
                     Style::default().fg(ACCENT),
                 )),

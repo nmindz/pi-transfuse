@@ -1,6 +1,7 @@
-//! The two ends of a session migration. The host holding a session packs it
-//! and lets it go only once the other host has it; the receiving host checks
-//! every byte, restores the session and puts it in the bucket of its cwd.
+//! The two ends of a session migration. The host holding a session packs it,
+//! or offers the archive it was packed into in place, and lets it go only
+//! once the other host has it; the receiving host checks every byte and puts
+//! the session in the bucket of its cwd, live or packed as it was sent.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -9,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{self, Compression};
+use crate::compact::{self, Local};
+use crate::paths::Roots;
 use crate::units::{self, Ctx, Node, Status, Unit};
 use crate::{human_size, paths, relocate, Side};
 
@@ -71,31 +74,39 @@ pub struct Offer {
     pub sha256: String,
 }
 
-/// A session packed and sent, kept until the other host has it.
-struct Sent {
-    unit: Unit,
-    nodes: Vec<Node>,
-    path: PathBuf,
+/// What was sent for one session, kept until the other host has it.
+enum Sent {
+    /// A live session packed into staging for the trip.
+    Live { unit: Box<Unit>, nodes: Vec<Node>, path: PathBuf },
+    /// An archive packed in place, sent as it is.
+    Packed { local: Box<Local>, sha256: String },
 }
 
 /// The OMP sessions this host gives away.
 pub struct Outbox<'a> {
     ctx: &'a Ctx,
     units: Option<Vec<Unit>>,
+    packed: Option<Vec<Local>>,
     staging: Option<Staging>,
-    sent: HashMap<String, Sent>,
+    sent: HashMap<(String, bool), Sent>,
     noted: bool,
 }
 
 impl<'a> Outbox<'a> {
     pub fn new(ctx: &'a Ctx) -> Outbox<'a> {
-        Outbox { ctx, units: None, staging: None, sent: HashMap::new(), noted: false }
+        Outbox { ctx, units: None, packed: None, staging: None, sent: HashMap::new(), noted: false }
     }
 
-    /// Every OMP session here, discovered on first use.
+    /// Every live OMP session here, discovered on first use.
     pub fn units(&mut self) -> &[Unit] {
         let ctx = self.ctx;
         self.units.get_or_insert_with(|| units::discover(&ctx.roots, &[Side::Pi]))
+    }
+
+    /// Every OMP session packed in place here, discovered on first use.
+    pub fn packed(&mut self) -> &[Local] {
+        let ctx = self.ctx;
+        self.packed.get_or_insert_with(|| compact::discover(&ctx.roots, &[Side::Pi]))
     }
 
     /// Which of `ids` a running omp holds.
@@ -121,15 +132,19 @@ impl<'a> Outbox<'a> {
             .map_err(|err| format!("cannot ask omp whether it is open: {err:#}"))
     }
 
-    /// Packs session `id`, refusing one a running omp holds or one that
-    /// changes while it is packed.
-    pub fn pack(&mut self, id: &str, compression: Compression) -> Result<Offer, Status> {
+    /// Offers session `id`: live, packed into staging, refusing one a running
+    /// omp holds or one that changes while it is packed; or `packed`, its
+    /// archive packed in place, checked end to end and sent as it is.
+    pub fn pack(&mut self, id: &str, packed: bool, compression: Compression) -> Result<Offer, Status> {
+        if packed {
+            return self.offer_packed(id);
+        }
         let unit = self
             .units()
             .iter()
             .find(|u| u.id == id)
             .cloned()
-            .ok_or_else(|| Status::Failed(format!("no OMP session {id} here")))?;
+            .ok_or_else(|| Status::Failed(format!("no live OMP session {id} here")))?;
         if self.open(id).map_err(Status::Failed)? {
             return Err(Status::Held);
         }
@@ -140,35 +155,71 @@ impl<'a> Outbox<'a> {
         let packed = archive::pack_nodes(root, &unit, &nodes, &dest, compression, &self.ctx.system, self.ctx.now_ms)
             .map_err(Status::from_error)?;
         let offer = Offer { path: dest, size: packed.archive_bytes, sha256: packed.archive_sha256 };
-        self.sent.insert(unit.id.clone(), Sent { unit, nodes, path: offer.path.clone() });
+        let sent = Sent::Live { unit: Box::new(unit), nodes, path: offer.path.clone() };
+        self.sent.insert((id.to_string(), false), sent);
         Ok(offer)
     }
 
-    /// Drops what was packed for `id`. With `delete`, also removes the
-    /// session, unless a running omp opened it or it changed since it was
-    /// packed. Returns the bytes freed, or why the session stays.
-    pub fn release(&mut self, id: &str, delete: bool) -> Result<u64, String> {
-        let sent = self.sent.remove(id).ok_or_else(|| format!("nothing was sent for {id}"))?;
-        let _ = fs::remove_file(&sent.path);
-        if !delete {
-            return Ok(0);
-        }
-        if self.open(id)? {
-            return Err("a running omp opened it meanwhile".into());
-        }
+    fn offer_packed(&mut self, id: &str) -> Result<Offer, Status> {
+        let local = self
+            .packed()
+            .iter()
+            .find(|l| l.manifest.id == id)
+            .cloned()
+            .ok_or_else(|| Status::Failed(format!("no OMP session {id} packed in place here")))?;
+        let checked = archive::verify(&local.path).map_err(failed)?;
+        let offer = Offer { path: local.path.clone(), size: checked.archive_bytes, sha256: checked.archive_sha256 };
+        self.sent.insert((id.to_string(), true), Sent::Packed { local: Box::new(local), sha256: offer.sha256.clone() });
+        Ok(offer)
+    }
+
+    /// Lets go of what was offered for `id`. With `delete`, also removes the
+    /// session, or its archive, unless it changed since it was offered or a
+    /// running omp opened it. Returns the bytes freed, or why it stays.
+    pub fn release(&mut self, id: &str, packed: bool, delete: bool) -> Result<u64, String> {
+        let sent = self.sent.remove(&(id.to_string(), packed)).ok_or_else(|| format!("nothing was sent for {id}"))?;
         let root = &self.ctx.roots.pi;
-        match units::walk(root, &sent.unit.members) {
-            Ok(now) if now == sent.nodes => {}
-            Ok(_) => return Err("it changed after it was sent".into()),
-            Err(err) => return Err(format!("{err:#}")),
+        match sent {
+            Sent::Live { unit, nodes, path } => {
+                let _ = fs::remove_file(&path);
+                if !delete {
+                    return Ok(0);
+                }
+                if self.open(id)? {
+                    return Err("a running omp opened it meanwhile".into());
+                }
+                match units::walk(root, &unit.members) {
+                    Ok(now) if now == nodes => {}
+                    Ok(_) => return Err("it changed after it was sent".into()),
+                    Err(err) => return Err(format!("{err:#}")),
+                }
+                units::remove_members(root, &unit.members).map_err(|err| format!("{err:#}"))?;
+                // A bucket left empty goes too; one still holding anything stays.
+                let _ = fs::remove_dir(root.join(&unit.bucket));
+                if let Some(units) = self.units.as_mut() {
+                    units.retain(|u| u.id != id);
+                }
+                Ok(unit.bytes)
+            }
+            Sent::Packed { local, sha256 } => {
+                if !delete {
+                    return Ok(0);
+                }
+                match relocate::digest(&local.path) {
+                    Ok((_, now)) if archive::hex(&now) == sha256 => {}
+                    Ok(_) => return Err("its archive changed after it was sent".into()),
+                    Err(err) => return Err(format!("{err:#}")),
+                }
+                fs::remove_file(&local.path).map_err(|err| format!("remove {}: {err}", local.path.display()))?;
+                if let Some(bucket) = local.path.parent() {
+                    let _ = fs::remove_dir(bucket);
+                }
+                if let Some(packed) = self.packed.as_mut() {
+                    packed.retain(|l| l.path != local.path);
+                }
+                Ok(local.archive_bytes)
+            }
         }
-        units::remove_members(root, &sent.unit.members).map_err(|err| format!("{err:#}"))?;
-        // A bucket left empty goes too; one still holding anything stays.
-        let _ = fs::remove_dir(root.join(&sent.unit.bucket));
-        if let Some(units) = self.units.as_mut() {
-            units.retain(|u| u.id != id);
-        }
-        Ok(sent.unit.bytes)
     }
 }
 
@@ -197,11 +248,12 @@ impl<'a> Inbox<'a> {
         Inbox { ctx, present: None, staging: None }
     }
 
-    /// Ids of the OMP sessions already here.
+    /// Ids of the OMP sessions already here, live or packed in place.
     pub fn present(&mut self) -> &HashSet<String> {
         let ctx = self.ctx;
         self.present.get_or_insert_with(|| {
-            units::discover(&ctx.roots, &[Side::Pi]).into_iter().map(|u| u.id).collect()
+            let live = units::discover(&ctx.roots, &[Side::Pi]).into_iter().map(|u| u.id);
+            live.chain(compact::discover(&ctx.roots, &[Side::Pi]).into_iter().map(|l| l.manifest.id)).collect()
         })
     }
 
@@ -241,15 +293,30 @@ impl<'a> Inbox<'a> {
     }
 
     /// Checks a received archive against the SHA-256 the sender announced and
-    /// against its own per-file sums, then restores session `id` into the
-    /// bucket of its cwd, or of `relocate` when given.
-    pub fn settle(&mut self, received: Received, id: &str, sha256: &str, relocate: Option<&str>) -> Result<Placed, Status> {
-        let result = self.place(&received, id, sha256, relocate);
+    /// against its own per-file sums, then puts session `id` in the bucket of
+    /// its cwd, or of `relocate` when given: restored, or still packed in
+    /// place when `packed`.
+    pub fn settle(
+        &mut self,
+        received: Received,
+        id: &str,
+        sha256: &str,
+        relocate: Option<&str>,
+        packed: bool,
+    ) -> Result<Placed, Status> {
+        let result = self.place(&received, id, sha256, relocate, packed);
         let _ = fs::remove_file(&received.path);
         result
     }
 
-    fn place(&mut self, received: &Received, id: &str, sha256: &str, relocate: Option<&str>) -> Result<Placed, Status> {
+    fn place(
+        &mut self,
+        received: &Received,
+        id: &str,
+        sha256: &str,
+        relocate: Option<&str>,
+        packed: bool,
+    ) -> Result<Placed, Status> {
         if received.sha256 != sha256 {
             return Err(Status::Failed(format!(
                 "the archive arrived damaged: SHA-256 {} where the sender has {sha256}",
@@ -265,21 +332,84 @@ impl<'a> Inbox<'a> {
             return Err(Status::Conflict(format!("session {id} is already here")));
         }
         let cwd = relocate.unwrap_or(&m.cwd).to_string();
-        let file = format!("{}.jsonl", m.name);
-        let root = &self.ctx.roots.pi;
-        let to = root.join(paths::encode_pi_bucket(&cwd)).join(&file);
-        let dir = staging_dir(&mut self.staging, root).map_err(failed)?;
-        let unpacked = dir.join(format!("unpacked-{}", next()));
+        let bucket = paths::encode_pi_bucket(&cwd);
+        let root = self.ctx.roots.pi.clone();
+        let dir = staging_dir(&mut self.staging, &root).map_err(failed)?;
         let remap = relocate.filter(|new| *new != m.cwd).map(|new| (m.cwd.as_str(), new));
-        let placed = archive::extract(&received.path, &unpacked)
-            .and_then(|_| relocate::place(&unpacked.join(&m.bucket).join(&file), &to, remap));
-        let _ = fs::remove_dir_all(&unpacked);
-        placed.map_err(Status::from_error)?;
+        let path = if !packed {
+            let file = format!("{}.jsonl", m.name);
+            let to = root.join(&bucket).join(&file);
+            let unpacked = dir.join(format!("unpacked-{}", next()));
+            let placed = archive::extract(&received.path, &unpacked)
+                .and_then(|_| relocate::place(&unpacked.join(&m.bucket).join(&file), &to, remap));
+            let _ = fs::remove_dir_all(&unpacked);
+            placed.map_err(Status::from_error)?;
+            to
+        } else if remap.is_none() && bucket == m.bucket {
+            let to = root.join(&bucket).join(format!("{}{}", m.name, m.compression.algo.extension()));
+            keep_packed(&received.path, &to).map_err(Status::from_error)?;
+            to
+        } else {
+            self.repack(received, &bucket, remap, &dir).map_err(Status::from_error)?
+        };
         if let Some(present) = self.present.as_mut() {
             present.insert(id.to_string());
         }
-        Ok(Placed { path: to, cwd })
+        Ok(Placed { path, cwd })
     }
+
+    /// A packed session whose bucket differs here, or that is relocated:
+    /// unpacked in staging, moved and rewritten there, and packed again into
+    /// its bucket here with the compression it came in.
+    fn repack(
+        &self,
+        received: &Received,
+        bucket: &str,
+        remap: Option<(&str, &str)>,
+        dir: &Path,
+    ) -> Result<PathBuf> {
+        let work = dir.join(format!("repack-{}", next()));
+        let result = (|| {
+            let m = archive::extract(&received.path, &work)?;
+            let file = format!("{}.jsonl", m.name);
+            relocate::place(&work.join(&m.bucket).join(&file), &work.join(bucket).join(&file), remap)?;
+            let roots = Roots { pi: work.clone(), dsh: work.join(".none"), claude: work.join(".none") };
+            let unit = units::discover(&roots, &[Side::Pi])
+                .into_iter()
+                .find(|u| u.id == m.id)
+                .ok_or_else(|| anyhow!("{} did not restore in staging", m.id))?;
+            let mut compression = m.compression;
+            if compression.algo == archive::Algo::Zstd {
+                compression.threads = archive::all_cores();
+            }
+            let to = self.ctx.roots.pi.join(bucket).join(format!("{}{}", m.name, compression.algo.extension()));
+            if to.symlink_metadata().is_ok() {
+                return Err(archive::Refusal::Conflict(format!("{} exists", to.display())).into());
+            }
+            archive::pack(&work, &unit, &to, compression, &self.ctx.system, self.ctx.now_ms)?;
+            Ok(to)
+        })();
+        let _ = fs::remove_dir_all(&work);
+        result
+    }
+}
+
+/// Moves a checked archive from staging to `to` in its bucket, on disk before
+/// the sender may delete its copy.
+fn keep_packed(from: &Path, to: &Path) -> Result<()> {
+    if to.symlink_metadata().is_ok() {
+        return Err(archive::Refusal::Conflict(format!("{} exists", to.display())).into());
+    }
+    let bucket = to.parent().ok_or_else(|| anyhow!("{} has no bucket", to.display()))?;
+    fs::create_dir_all(bucket).with_context(|| format!("create {}", bucket.display()))?;
+    let tmp = archive::partial(to);
+    let result = relocate::copy_file(from, &tmp)
+        .and_then(|()| File::open(&tmp).and_then(|f| f.sync_all()).with_context(|| format!("sync {}", tmp.display())))
+        .and_then(|()| fs::rename(&tmp, to).with_context(|| format!("rename into {}", to.display())));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Copies exactly `size` bytes and returns their SHA-256; a stream that ends

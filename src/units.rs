@@ -449,6 +449,7 @@ pub fn choose_with(
         sort: choice.sort,
         now_ms: choice.now_ms,
         settings: settings.clone(),
+        extra_keys: Vec::new(),
     };
     let Some(picked) = pick::pick(spec)? else {
         return Ok(Vec::new());

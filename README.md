@@ -63,7 +63,7 @@ The detail pane shows where a session would land and warns when that file alread
 
 ### Remote tab
 
-The fourth tab runs [`migrate`](#migrating-omp-sessions-between-hosts) against another host. `c` (or `enter` while disconnected) asks for a host, offering every concrete `Host` of `~/.ssh/config` as you type; the tab then lists the OMP sessions on the sending side, which `p` switches between the remote host (pull) and this one (push). `space`, `a`, `A` and `/` select and filter as elsewhere, `D` toggles delete-source and `R` sets the directory to relocate into on the receiving host, both shown under the list. `x` asks for confirmation and migrates the selection, or the session under the cursor, with transfer progress in the detail pane and one line per session in the activity log; `r` lists again. Sessions open in a running omp on the sending side, or already on the receiving side, are dimmed.
+The fourth tab runs [`migrate`](#migrating-omp-sessions-between-hosts) against another host, always OMP to OMP; the converter's `converts to DSH` in the Pi tab is a different thing, between harnesses on this host. `C` (or `enter` while disconnected) asks for a host, offering every concrete `Host` of `~/.ssh/config` as you type, and `P` switches between pulling from it and pushing to it. The sending side's OMP sessions, live and packed in place, then fill the same [picker](#choosing-sessions) `compact` uses, with its checkboxes, `space`, `a` (every shown session, or none when all are), `A` (clear), `p` (a whole path), `/` search, `f` filters, `[`/`]` threshold, `U` untitled and sort keys, and with `D` delete-source and `R` relocate-to in its top bar. `x` or `enter` asks for confirmation and migrates the selection, with transfer progress on the line above the list and one line per session in the activity log, after which the list is read again with your filters, sort and selection kept; `r` reads it again by hand. Sessions open in a running omp on the sending side, or already on the receiving side live or packed, are dimmed.
 
 When ssh needs a password, a key passphrase or a decision on an unknown host key, a dialog shows its question whichever tab is open: typing stays hidden for passwords and passphrases, `enter` answers and `esc` declines. The browser starts ssh detached from the terminal with itself as `SSH_ASKPASS`, so ssh's prompts and messages never draw over the screen; its messages land in the activity log. The tab uses plain `ssh` with `~/.ssh/config` for everything else and finds pi-transfuse on the remote host [as `migrate` does](#migrating-omp-sessions-between-hosts); `PI_TRANSFUSE_REMOTE_BIN` names it when that fails.
 
@@ -121,9 +121,9 @@ Sessions a running omp holds (`omp session lease`) are reported `held` and skipp
 `migrate` moves OMP sessions between this machine and another over SSH: `pull` brings them here, `push` sends them there. Each session goes over as one archive in the [archive format](#archive-format) (zstd by default), is checked on arrival against the SHA-256 its sender computed and against the per-file sums inside, and is restored under the receiving host's Pi root into the bucket of its cwd, ready for `omp --resume` there.
 
 ```sh
-pi-transfuse migrate list [HOST] [FILTERS] [--sort KEY] [--reverse] [--long | --json] [SSH]
-pi-transfuse migrate pull [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
-pi-transfuse migrate push [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+pi-transfuse migrate list [HOST] [FILTERS] [--sort KEY] [--reverse] [--older-than AGE] [--long | --json] [SSH]
+pi-transfuse migrate pull [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--older-than AGE] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
+pi-transfuse migrate push [HOST] [SESSION...] [FILTERS] [--sort KEY] [--reverse] [--older-than AGE] [--delete] [--relocate DIR] [--algo gzip|zstd] [--level N] [--threads N] [--yes] [--dry-run] [SSH]
 
 SSH: [--ssh PROGRAM] [--ssh-arg ARG]... [--remote-bin PATH]
 ```
@@ -136,7 +136,9 @@ sshd runs the remote command through your login shell without a terminal, so zsh
 
 `--relocate DIR` is a built-in `relocate` for the arriving sessions: each is restored as if it had run in `DIR` on the receiving host, so its header `cwd` becomes `DIR`, `additionalDirectories` and subagent cwds under the old cwd move beneath `DIR`, and it lands in `DIR`'s bucket. `DIR` must exist on the receiving host, and `~` there is that host's home. Every other byte of the session stays as it was.
 
-Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. Sessions a running omp holds on the sending host, and sessions the receiving host already has, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are open there and which are already here. The browser's [Remote tab](#remote-tab) does the same interactively.
+Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. The [filters](#sorting-and-filtering) work as for `compact`: `--include project=api,web` keeps those projects, `--hide-untitled` drops sessions without a title, `--older-than` sets the threshold (none by default), and `--yes` takes every match. Sessions a running omp holds on the sending host, and sessions the receiving host already has, live or packed, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are packed in place, open there, or already here. The browser's [Remote tab](#remote-tab) does the same interactively.
+
+Sessions packed in place (`compact pack`) migrate too, and stay packed: the archive is checked end to end, sent as it is, checked again on arrival, and put in the bucket of its cwd, byte for byte. With `--relocate`, or when the cwd maps to another bucket on the receiving host, it is unpacked in the hidden staging directory, moved and rewritten, and packed again with the compression it came in. `--delete` removes the sender's archive once it arrived, unless the archive changed meanwhile.
 
 Authentication is OpenSSH's own: keys, ssh-agent and `~/.ssh/config` apply exactly as for `ssh <HOST>`, so a key per host is an `IdentityFile` under its `Host` entry (or `--ssh-arg=-i --ssh-arg=KEY` for one run). On the command line ssh asks for a password, a key passphrase or a new host key in the terminal, before the picker opens; without a terminal only key or agent authentication works, and `--ssh-arg=-oBatchMode=yes` makes a missing key fail at once instead of waiting.
 
@@ -169,7 +171,7 @@ pi-transfuse vault push    <STORE> [SESSION...] [--older-than 30d] [FILTERS] [--
 pi-transfuse vault pull    <STORE> [SESSION|ARCHIVE...] [FILTERS] [--sort KEY] [--reverse] [--remove] [--yes] [--dry-run]
 pi-transfuse vault reindex <STORE>
 
-FILTERS: [--include FIELD=VALUE[,VALUE…]]... [--exclude FIELD=VALUE[,VALUE…]]... [--filter TEXT]
+FILTERS: [--include FIELD=VALUE[,VALUE…]]... [--exclude FIELD=VALUE[,VALUE…]]... [--filter TEXT] [--hide-untitled]
 ```
 
 A session is everything it owns: a Pi transcript with its artifact directory (subagent transcripts included) and lock sidecar; a DSH session directory with every log generation; a Claude Code transcript with its subagent directory. Its last use is the newest modification time among those paths. `--older-than` takes `30d`, `2w`, `36h`, or a bare number of days. `stale` lists the sessions past the threshold with their sizes and a per-path total, and changes nothing.
@@ -191,7 +193,7 @@ A session's **path** is the directory it ran in; its **project** is that directo
 | `harness` | harness | `h` |
 | `title` | title, A→Z | `t` |
 
-`--include FIELD=VALUE[,VALUE…]` keeps sessions matching any of the values; `--exclude` drops them. Both repeat, and a session must match every `--include`. Fields: `harness` (`pi` or `omp`, `dsh`, `claude` or `claude-code`), `project` (folder name, any case), and `path` (that directory and everything below it, on whole path components; `~` expands). Excluded harnesses are not read at all. `--filter TEXT` keeps sessions whose id, title, or path contains the text.
+`--include FIELD=VALUE[,VALUE…]` keeps sessions matching any of the values; `--exclude` drops them. Both repeat, and a session must match every `--include`. Fields: `harness` (`pi` or `omp`, `dsh`, `claude` or `claude-code`), `project` (folder name, any case), and `path` (that directory and everything below it, on whole path components; `~` expands). Excluded harnesses are not read at all. `--filter TEXT` keeps sessions whose id, title, or path contains the text, and `--hide-untitled` leaves out sessions without a title.
 
 ```sh
 pi-transfuse stale --exclude harness=dsh --sort project
@@ -203,7 +205,7 @@ Exit status of `compact` and `vault`: 0 when every chosen session went through, 
 
 ### Choosing sessions
 
-Without session arguments, `pack`, `unpack`, `push` and `pull` open a picker on a terminal:
+Without session arguments, `pack`, `unpack`, `push`, `pull`, `migrate pull` and `migrate push` open a picker on a terminal:
 
 | Key | Action |
 |---|---|
@@ -211,7 +213,8 @@ Without session arguments, `pack`, `unpack`, `push` and `pull` open a picker on 
 | `a` / `A` | select every shown session, or deselect them when all are selected (the header checkbox shows `[ ]`, `[-]`, `[x]`) / clear the whole selection |
 | `p` | toggle every shown session in the cursor's path |
 | `/` | filter by id, title, or path |
-| `f` | filter panel: show or hide each harness and project, counted over what the search and threshold leave (`space` toggles, `o` shows only that one, `a` shows all) |
+| `f` | filter panel: show or hide each harness, project, and the untitled sessions, counted over what the search and threshold leave (`space` toggles, `o` shows only that harness or project, `a` shows all) |
+| `U` | hide or show sessions without a title |
 | `[` / `]` | lower / raise the unused-for threshold through 0, 7, 15, 30, 60, 90, 180, 365 days |
 | `u` `s` `z` `c` `d` `n` `h` `t` | sort by last used, size, archive size, created, path, project, harness, title; the same key again reverses |
 | `enter` | confirm the selection, or the session under the cursor |

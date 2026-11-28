@@ -1,36 +1,38 @@
-//! The browser's Remote tab: connect to another host over ssh, list the OMP
-//! sessions on the sending side, select them and migrate them, with ssh's
-//! password, passphrase and host-key questions answered in a dialog.
+//! The browser's Remote tab: connect to another host over ssh, then pick OMP
+//! sessions on the sending side, live or packed in place, in the same picker
+//! `compact` uses (search, harness, project and untitled filters, threshold,
+//! sort, checkboxes), and migrate them. ssh's password, passphrase and
+//! host-key questions are answered in a dialog.
 //!
 //! A worker thread owns the connection so the browser keeps drawing, and
 //! answers ssh, while ssh connects and archives stream.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction as Axis, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::archive::{Algo, CompressArgs};
+use crate::archive::{Algo, CompressArgs, Compression};
 use crate::askpass::{self, Question};
-use crate::migrate::{self, Direction, Plan};
-use crate::pick::Row;
+use crate::facts::{Sort, SortKey};
+use crate::migrate::{self, Direction, Plan, Source};
+use crate::pick::{Picker, Spec};
 use crate::transfer::{Inbox, Outbox};
 use crate::tui::{centered, ACCENT, BAD, DIM, OK, WARN};
-use crate::units::{Ctx, Status, Verb};
-use crate::wire::{Launch, Remote, SshArgs, Terms};
+use crate::units::{self, Ctx, Status, Verb};
+use crate::wire::{Launch, Remote, SshArgs};
 use crate::{clip, human_size, paths};
 
 /// Work the browser hands the connection.
 enum Job {
     List(Direction),
-    Migrate { direction: Direction, ids: Vec<String>, delete: bool, relocate: Option<String> },
+    Migrate { direction: Direction, sources: Vec<Source>, delete: bool, relocate: Option<String> },
 }
 
 /// What the connection reports back.
@@ -43,13 +45,6 @@ enum Event {
     Idle,
     /// The connection is gone, or never came up.
     Closed(String),
-}
-
-/// Text typed into a dialog.
-enum Input {
-    Host { text: String, pick: usize },
-    Relocate(String),
-    Filter(String),
 }
 
 #[derive(PartialEq, Eq)]
@@ -66,17 +61,12 @@ pub struct RemoteTab {
     host: Option<String>,
     stage: Stage,
     direction: Direction,
+    compression: Compression,
+    /// The sessions the picker shows, in the order of its rows.
     plan: Option<Plan>,
-    rows: Vec<Row>,
-    /// Indices into `rows` the filter shows.
-    view: Vec<usize>,
-    filter: String,
-    cursor: usize,
-    selected: HashSet<String>,
-    delete: bool,
-    relocate: String,
-    input: Option<Input>,
-    confirm: bool,
+    picker: Option<Picker>,
+    /// The host dialog: typed text and the offered host under the cursor.
+    choosing: Option<(String, usize)>,
     question: Option<(Question, String)>,
     progress: Option<(String, u64, u64)>,
     jobs: Option<Sender<Job>>,
@@ -94,21 +84,17 @@ impl RemoteTab {
     pub fn new() -> RemoteTab {
         let (events_tx, events) = mpsc::channel();
         let (questions_tx, questions) = mpsc::channel();
+        let defaults = CompressArgs { algo: None, level: None, threads: None };
+        let fallback = Compression { algo: Algo::Zstd, level: 3, threads: 0 };
         RemoteTab {
             hosts: ssh_config_hosts(),
             host: None,
             stage: Stage::Disconnected,
             direction: Direction::Pull,
+            compression: defaults.resolve(Algo::Zstd).unwrap_or(fallback),
             plan: None,
-            rows: Vec::new(),
-            view: Vec::new(),
-            filter: String::new(),
-            cursor: 0,
-            selected: HashSet::new(),
-            delete: false,
-            relocate: String::new(),
-            input: None,
-            confirm: false,
+            picker: None,
+            choosing: None,
             question: None,
             progress: None,
             jobs: None,
@@ -132,7 +118,7 @@ impl RemoteTab {
         if let Some(direction) = direction {
             self.direction = direction;
         }
-        self.input = Some(Input::Host { text: String::new(), pick: 0 });
+        self.choosing = Some((String::new(), 0));
     }
 
     fn say(&mut self, text: impl Into<String>, color: Color) {
@@ -176,20 +162,28 @@ impl RemoteTab {
         }
     }
 
+    /// Shows a fresh listing, keeping the user's filters, sort, selection and
+    /// settings from the previous one.
     fn show(&mut self, plan: Plan) {
-        self.rows = plan.sources.iter().map(|u| plan.candidate(u, self.now_ms).row).collect();
-        let ids: HashSet<&str> = plan.sources.iter().map(|u| u.id.as_str()).collect();
-        self.selected.retain(|id| ids.contains(id.as_str()));
+        let rows = plan.sources.iter().map(|s| plan.candidate(s, self.now_ms).row).collect();
+        let host = self.host.clone().unwrap_or_default();
+        let spec = Spec {
+            title: migrate::title(self.direction, &host, self.compression),
+            verb: "migrate".into(),
+            headers: units::HEADERS.iter().map(|h| h.to_string()).collect(),
+            rows,
+            threshold_days: Some(0),
+            sort: Sort { key: SortKey::Used, reverse: false },
+            now_ms: self.now_ms,
+            settings: migrate::settings(false, None),
+            extra_keys: extra_keys(),
+        };
+        let mut picker = Picker::embedded(spec);
+        if let Some(old) = &self.picker {
+            picker.restore(old.keep());
+        }
+        self.picker = Some(picker);
         self.plan = Some(plan);
-        self.reindex();
-    }
-
-    fn reindex(&mut self) {
-        let needle = self.filter.to_lowercase();
-        let mut view: Vec<usize> = (0..self.rows.len()).filter(|&i| self.rows[i].facts.mentions(&needle)).collect();
-        view.sort_by_key(|&i| self.rows[i].facts.last_used_ms);
-        self.view = view;
-        self.cursor = self.cursor.min(self.view.len().saturating_sub(1));
     }
 
     fn connect(&mut self, host: String) {
@@ -213,17 +207,15 @@ impl RemoteTab {
         self.host = Some(host);
         self.stage = Stage::Connecting;
         self.plan = None;
-        self.rows.clear();
-        self.view.clear();
-        self.selected.clear();
+        self.picker = None;
     }
 
     fn send(&mut self, job: Job) {
-        let sent = self.jobs.as_ref().is_some_and(|jobs| jobs.send(job).is_ok());
+        let sent = self.stage == Stage::Ready && self.jobs.as_ref().is_some_and(|jobs| jobs.send(job).is_ok());
         if sent {
             self.stage = Stage::Busy;
         } else {
-            self.say("not connected: c chooses a host", WARN);
+            self.say("busy or not connected: C chooses a host", WARN);
         }
     }
 
@@ -232,200 +224,108 @@ impl RemoteTab {
             Direction::Pull => Direction::Push,
             Direction::Push => Direction::Pull,
         };
-        self.selected.clear();
         if self.stage == Stage::Ready {
             self.send(Job::List(self.direction));
         }
     }
 
-    fn cursor_row(&self) -> Option<usize> {
-        self.view.get(self.cursor).copied()
-    }
-
-    fn toggle(&mut self, index: usize) {
-        if let Some(reason) = self.rows[index].blocked.clone() {
-            self.say(reason, WARN);
-            return;
+    /// Migrates what the picker confirmed.
+    fn migrate(&mut self, rows: Vec<usize>) {
+        let Some(plan) = &self.plan else { return };
+        let sources: Vec<Source> = rows.iter().filter_map(|&i| plan.sources.get(i).cloned()).collect();
+        let settings = self.picker.as_ref().map(|p| p.settings().to_vec()).unwrap_or_default();
+        let (delete, relocate) = migrate::chosen_settings(&settings);
+        if !sources.is_empty() {
+            self.send(Job::Migrate { direction: self.direction, sources, delete, relocate });
         }
-        let id = self.rows[index].facts.id.clone();
-        if !self.selected.remove(&id) {
-            self.selected.insert(id);
-        }
-    }
-
-    fn toggle_all(&mut self) {
-        let shown: Vec<String> =
-            self.view.iter().filter(|&&i| self.rows[i].blocked.is_none()).map(|&i| self.rows[i].facts.id.clone()).collect();
-        let all = !shown.is_empty() && shown.iter().all(|id| self.selected.contains(id));
-        for id in shown {
-            if all {
-                self.selected.remove(&id);
-            } else {
-                self.selected.insert(id);
-            }
-        }
-    }
-
-    /// Selected sessions still shown, else the one under the cursor.
-    fn chosen(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .view
-            .iter()
-            .map(|&i| &self.rows[i])
-            .filter(|r| r.blocked.is_none() && self.selected.contains(&r.facts.id))
-            .map(|r| r.facts.id.clone())
-            .collect();
-        if ids.is_empty() {
-            if let Some(i) = self.cursor_row().filter(|&i| self.rows[i].blocked.is_none()) {
-                ids.push(self.rows[i].facts.id.clone());
-            }
-        }
-        ids
-    }
-
-    fn start_migration(&mut self) {
-        let ids = self.chosen();
-        if ids.is_empty() {
-            return;
-        }
-        let relocate = Some(self.relocate.trim().to_string()).filter(|d| !d.is_empty());
-        self.send(Job::Migrate { direction: self.direction, ids, delete: self.delete, relocate });
     }
 
     /// Handles one key; false leaves it to the browser.
     pub fn key(&mut self, key: KeyEvent) -> bool {
-        if let Some((question, mut typed)) = self.question.take() {
+        if let Some((question, typed)) = self.question.take() {
+            self.answer(question, typed, key.code);
+            return true;
+        }
+        if let Some((text, pick)) = self.choosing.take() {
+            self.choose(text, pick, key.code);
+            return true;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let consumed = match &mut self.picker {
+            Some(picker) if picker.captures_keys() => {
+                picker.handle(key);
+                true
+            }
+            _ => false,
+        };
+        if !consumed {
             match key.code {
-                KeyCode::Enter if question.notice => question.answer(None),
-                KeyCode::Enter => question.answer(Some(typed)),
-                KeyCode::Esc => {
-                    question.answer(None);
-                    self.say("declined ssh's question", WARN);
-                }
-                KeyCode::Backspace => {
-                    typed.pop();
-                    self.question = Some((question, typed));
-                }
-                KeyCode::Char(c) if !question.notice => {
-                    typed.push(c);
-                    self.question = Some((question, typed));
-                }
-                _ => self.question = Some((question, typed)),
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1' | '2' | '3' | '4' | 'q') => return false,
+                KeyCode::Char('c') if ctrl => return false,
+                KeyCode::Char('C') => self.choosing = Some((String::new(), 0)),
+                KeyCode::Enter if self.picker.is_none() => self.choosing = Some((String::new(), 0)),
+                KeyCode::Char('P') => self.flip_direction(),
+                KeyCode::Char('r') => self.send(Job::List(self.direction)),
+                KeyCode::Char('x') => match &mut self.picker {
+                    Some(picker) if self.stage == Stage::Ready => picker.request_confirm(),
+                    _ => self.say("busy or not connected", WARN),
+                },
+                _ => match &mut self.picker {
+                    Some(picker) => picker.handle(key),
+                    None => return false,
+                },
             }
-            return true;
         }
-        if self.confirm {
-            self.confirm = false;
-            if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
-                self.start_migration();
-            }
-            return true;
-        }
-        if let Some(input) = self.input.take() {
-            self.edit(input, key.code);
-            return true;
-        }
-        let last = self.view.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Char('c') => self.input = Some(Input::Host { text: String::new(), pick: 0 }),
-            KeyCode::Enter if self.stage == Stage::Disconnected => {
-                self.input = Some(Input::Host { text: String::new(), pick: 0 })
-            }
-            KeyCode::Char('p') => self.flip_direction(),
-            KeyCode::Char('r') if self.stage == Stage::Ready => self.send(Job::List(self.direction)),
-            KeyCode::Char('j') | KeyCode::Down => self.cursor = (self.cursor + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::PageDown => self.cursor = (self.cursor + 10).min(last),
-            KeyCode::PageUp => self.cursor = self.cursor.saturating_sub(10),
-            KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => self.cursor = last,
-            KeyCode::Char(' ') => {
-                if let Some(i) = self.cursor_row() {
-                    self.toggle(i);
-                }
-            }
-            KeyCode::Char('a') => self.toggle_all(),
-            KeyCode::Char('A') => self.selected.clear(),
-            KeyCode::Char('/') => self.input = Some(Input::Filter(self.filter.clone())),
-            KeyCode::Char('D') => {
-                self.delete = !self.delete;
-                let state = if self.delete { "on" } else { "off" };
-                self.say(format!("delete source: {state}"), WARN);
-            }
-            KeyCode::Char('R') => self.input = Some(Input::Relocate(self.relocate.clone())),
-            KeyCode::Char('x') if self.stage == Stage::Ready => {
-                if self.chosen().is_empty() {
-                    self.say("nothing selected to migrate", WARN);
-                } else {
-                    self.confirm = true;
-                }
-            }
-            KeyCode::Char('x') => self.say("busy or not connected", WARN),
-            _ => return false,
+        if let Some(picked) = self.picker.as_mut().and_then(Picker::take_confirmed) {
+            self.migrate(picked.rows);
         }
         true
     }
 
-    fn edit(&mut self, input: Input, code: KeyCode) {
-        match input {
-            Input::Host { mut text, mut pick } => {
-                let offered = self.offered(&text);
-                match code {
-                    KeyCode::Esc => return,
-                    KeyCode::Enter => {
-                        let host = offered.get(pick).cloned().unwrap_or_else(|| text.trim().to_string());
-                        if !host.is_empty() {
-                            self.connect(host);
-                        }
-                        return;
-                    }
-                    KeyCode::Down => pick = (pick + 1).min(offered.len().saturating_sub(1)),
-                    KeyCode::Up => pick = pick.saturating_sub(1),
-                    KeyCode::Backspace => {
-                        text.pop();
-                        pick = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        text.push(c);
-                        pick = 0;
-                    }
-                    _ => {}
-                }
-                self.input = Some(Input::Host { text, pick });
+    fn answer(&mut self, question: Question, mut typed: String, code: KeyCode) {
+        match code {
+            KeyCode::Enter if question.notice => question.answer(None),
+            KeyCode::Enter => question.answer(Some(typed)),
+            KeyCode::Esc => {
+                question.answer(None);
+                self.say("declined ssh's question", WARN);
             }
-            Input::Relocate(mut text) => match code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => self.relocate = text.trim().to_string(),
-                KeyCode::Backspace => {
-                    text.pop();
-                    self.input = Some(Input::Relocate(text));
-                }
-                KeyCode::Char(c) => {
-                    text.push(c);
-                    self.input = Some(Input::Relocate(text));
-                }
-                _ => self.input = Some(Input::Relocate(text)),
-            },
-            Input::Filter(mut text) => {
-                match code {
-                    KeyCode::Esc => text.clear(),
-                    KeyCode::Enter => {}
-                    KeyCode::Backspace => {
-                        text.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        text.push(c);
-                    }
-                    _ => {}
-                }
-                let done = matches!(code, KeyCode::Esc | KeyCode::Enter);
-                self.filter = text.clone();
-                self.reindex();
-                if !done {
-                    self.input = Some(Input::Filter(text));
-                }
+            KeyCode::Backspace => {
+                typed.pop();
+                self.question = Some((question, typed));
             }
+            KeyCode::Char(c) if !question.notice => {
+                typed.push(c);
+                self.question = Some((question, typed));
+            }
+            _ => self.question = Some((question, typed)),
         }
+    }
+
+    fn choose(&mut self, mut text: String, mut pick: usize, code: KeyCode) {
+        let offered = self.offered(&text);
+        match code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                let host = offered.get(pick).cloned().unwrap_or_else(|| text.trim().to_string());
+                if !host.is_empty() {
+                    self.connect(host);
+                }
+                return;
+            }
+            KeyCode::Down => pick = (pick + 1).min(offered.len().saturating_sub(1)),
+            KeyCode::Up => pick = pick.saturating_sub(1),
+            KeyCode::Backspace => {
+                text.pop();
+                pick = 0;
+            }
+            KeyCode::Char(c) => {
+                text.push(c);
+                pick = 0;
+            }
+            _ => {}
+        }
+        self.choosing = Some((text, pick));
     }
 
     /// Configured hosts matching what was typed; the typed text itself is
@@ -443,139 +343,67 @@ impl RemoteTab {
     }
 
     pub fn footer(&self) -> String {
-        if let Some(Input::Filter(text)) = &self.input {
-            return format!("filter: {text}▏ (enter to apply, esc to clear)");
-        }
-        "c connect · p pull/push · space select · a all · / filter · D delete source · R relocate · x migrate · r refresh · tab switch · ? help · q quit".into()
+        "C connect · P pull/push · x migrate · r relist · tab switch · ? keys · q quit".into()
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let split = Layout::default()
-            .direction(Axis::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .direction(Axis::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(4)])
             .split(area);
-        self.draw_list(frame, split[0]);
-        self.draw_detail(frame, split[1]);
-        if let Some(input) = &self.input {
-            self.draw_input(frame, area, input);
+        frame.render_widget(Paragraph::new(self.state_line()), split[0]);
+        let title = migrate::title(self.direction, self.host.as_deref().unwrap_or("no host"), self.compression);
+        match &mut self.picker {
+            Some(picker) => {
+                picker.set_title(title);
+                picker.draw(frame, split[1]);
+            }
+            None => {
+                let text = match self.stage {
+                    Stage::Disconnected => "  C or enter chooses a host to connect to",
+                    _ => "  waiting for the remote host…",
+                };
+                let block = Block::bordered().border_type(BorderType::Rounded).title(format!(" {title} "));
+                frame.render_widget(Paragraph::new(Span::styled(text, Style::default().fg(DIM))).block(block), split[1]);
+            }
         }
-        if self.confirm {
-            self.draw_confirm(frame, area);
+        if let Some((text, pick)) = &self.choosing {
+            self.draw_hosts(frame, area, text, *pick);
         }
         if let Some((question, typed)) = &self.question {
             draw_question(frame, area, question, typed);
         }
     }
 
-    fn heading(&self) -> String {
+    /// Direction, connection state and transfer progress.
+    fn state_line(&self) -> Line<'static> {
         let host = self.host.as_deref().unwrap_or("no host");
         let way = match self.direction {
-            Direction::Pull => format!("pull ← {host}"),
-            Direction::Push => format!("push → {host}"),
+            Direction::Pull => format!(" OMP here ← OMP on {host}"),
+            Direction::Push => format!(" OMP here → OMP on {host}"),
         };
-        let stage = match self.stage {
-            Stage::Disconnected => " · disconnected",
-            Stage::Connecting => " · connecting…",
-            Stage::Busy => " · working…",
-            Stage::Ready => "",
+        let (stage, color) = match self.stage {
+            Stage::Disconnected => ("disconnected", DIM),
+            Stage::Connecting => ("connecting…", WARN),
+            Stage::Busy => ("migrating…", WARN),
+            Stage::Ready => ("connected", OK),
         };
-        format!(" {way}{stage} ")
-    }
-
-    fn draw_list(&self, frame: &mut Frame, area: Rect) {
-        let mut settings = vec![Span::styled(
-            format!(" delete source: {} ", if self.delete { "on" } else { "off" }),
-            Style::default().fg(if self.delete { WARN } else { DIM }),
-        )];
-        let relocate = if self.relocate.is_empty() { "—" } else { self.relocate.as_str() };
-        settings.push(Span::styled(format!("· relocate to: {} ", clip(relocate, 40)), Style::default().fg(DIM)));
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .title(Span::styled(self.heading(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
-            .title_bottom(Line::from(settings));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let mut lines: Vec<ListItem> = Vec::new();
-        if self.host.is_none() {
-            lines.push(ListItem::new(Span::styled("  c or enter chooses a host to connect to", Style::default().fg(DIM))));
-        } else if self.rows.is_empty() && self.stage != Stage::Ready {
-            lines.push(ListItem::new(Span::styled("  waiting for the remote host…", Style::default().fg(DIM))));
-        } else if self.view.is_empty() {
-            lines.push(ListItem::new(Span::styled("  no OMP sessions on the sending side", Style::default().fg(DIM))));
-        }
-        for (pos, &i) in self.view.iter().enumerate() {
-            let row = &self.rows[i];
-            let mark = if row.blocked.is_some() {
-                "·  "
-            } else if self.selected.contains(&row.facts.id) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let style = match (row.blocked.is_some(), pos == self.cursor, self.selected.contains(&row.facts.id)) {
-                (true, _, _) => Style::default().fg(DIM),
-                (_, true, _) => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                (_, _, true) => Style::default().fg(OK),
-                _ => Style::default(),
-            };
-            let c = &row.columns;
-            let text = format!(
-                "{mark} {:>5} {:>9}  {:<18} {}",
-                c.first().map_or("", String::as_str),
-                c.get(1).map_or("", String::as_str),
-                clip(c.get(4).map_or("", String::as_str), 18),
-                c.get(5).map_or("", String::as_str)
-            );
-            lines.push(ListItem::new(Span::styled(text, style)));
-        }
-        let mut state = ListState::default();
-        if !self.view.is_empty() {
-            state.select(Some(self.cursor));
-        }
-        frame.render_stateful_widget(List::new(lines), inner, &mut state);
-    }
-
-    fn draw_detail(&self, frame: &mut Frame, area: Rect) {
-        let mut lines: Vec<Line> = Vec::new();
+        let mut spans = vec![
+            Span::styled(way, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" · {stage}"), Style::default().fg(color)),
+        ];
         if let Some((label, done, total)) = &self.progress {
             let percent = done.saturating_mul(100).checked_div(*total).unwrap_or(100);
-            lines.push(Line::from(Span::styled(
-                format!("{label}  {percent}%  {} / {}", human_size(*done), human_size(*total)),
+            spans.push(Span::styled(
+                format!(" · {label} {percent}% {} / {}", human_size(*done), human_size(*total)),
                 Style::default().fg(ACCENT),
-            )));
-            lines.push(Line::from(""));
+            ));
         }
-        if let Some(plan) = &self.plan {
-            lines.push(Line::from(Span::styled(format!("{} → {}", plan.from, plan.to), Style::default().fg(DIM))));
-        }
-        if let Some(i) = self.cursor_row() {
-            let row = &self.rows[i];
-            let width = row.details.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) + 2;
-            if let Some(reason) = &row.blocked {
-                lines.push(Line::from(Span::styled(reason.clone(), Style::default().fg(WARN))));
-            }
-            for (label, value) in &row.details {
-                for (n, part) in value.split('\n').enumerate() {
-                    let label = if n == 0 { label.as_str() } else { "" };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{label:<width$}"), Style::default().fg(DIM)),
-                        Span::raw(part.to_string()),
-                    ]));
-                }
-            }
-        }
-        let paragraph = Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().border_type(BorderType::Rounded).title(" detail "));
-        frame.render_widget(paragraph, area);
+        Line::from(spans)
     }
 
-    fn draw_input(&self, frame: &mut Frame, area: Rect, input: &Input) {
-        let (title, text, offered, pick) = match input {
-            Input::Host { text, pick } => (" connect to ", text.as_str(), self.offered(text), *pick),
-            Input::Relocate(text) => (" relocate to (directory on the receiving host; empty for none) ", text.as_str(), Vec::new(), 0),
-            Input::Filter(_) => return,
-        };
+    fn draw_hosts(&self, frame: &mut Frame, area: Rect, text: &str, pick: usize) {
+        let offered = self.offered(text);
         let area = centered(area, 60, if offered.is_empty() { 20 } else { 60 });
         frame.render_widget(Clear, area);
         let mut lines = vec![Line::from(format!(" {text}▏")), Line::from("")];
@@ -583,43 +411,24 @@ impl RemoteTab {
             let style = if n == pick { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default().fg(DIM) };
             lines.push(Line::from(Span::styled(format!("  {host}"), style)));
         }
-        lines.push(Line::from(Span::styled(" enter accept · esc cancel", Style::default().fg(DIM))));
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(Block::bordered().border_type(BorderType::Rounded).title(title)),
-            area,
-        );
+        lines.push(Line::from(Span::styled(" ↑↓ pick · enter connect · esc cancel", Style::default().fg(DIM))));
+        let block = Block::bordered().border_type(BorderType::Rounded).title(" connect to ");
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
+}
 
-    fn draw_confirm(&self, frame: &mut Frame, area: Rect) {
-        let area = centered(area, 60, 45);
-        frame.render_widget(Clear, area);
-        let ids = self.chosen();
-        let bytes: u64 =
-            self.rows.iter().filter(|r| ids.contains(&r.facts.id)).map(|r| r.facts.bytes).sum();
-        let mut lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("{} {} session(s) · {}?", self.heading().trim(), ids.len(), human_size(bytes)),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        if self.delete {
-            lines.push(Line::from(Span::styled("delete source: on", Style::default().fg(WARN))));
-        }
-        if !self.relocate.is_empty() {
-            lines.push(Line::from(format!("relocate to: {}", self.relocate)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("y / enter confirm · n / esc back", Style::default().fg(DIM))));
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .alignment(ratatui::layout::Alignment::Center)
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().border_type(BorderType::Rounded).title(" migrate ")),
-            area,
-        );
-    }
+/// The browser's keys, for the picker's help.
+fn extra_keys() -> Vec<(String, String)> {
+    [
+        ("C", "connect to a host (Host entries of ~/.ssh/config offered)"),
+        ("P", "switch between pull (here ← host) and push (here → host)"),
+        ("x / enter", "migrate the selection after a confirmation"),
+        ("r", "list the sending side again"),
+        ("tab / 1-4", "switch tabs"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 fn draw_question(frame: &mut Frame, area: Rect, question: &Question, typed: &str) {
@@ -670,8 +479,8 @@ fn worker(host: String, socket: Option<PathBuf>, direction: Direction, jobs: Rec
     while let Some(job) = first.take().or_else(|| jobs.recv().ok()) {
         let result = match job {
             Job::List(direction) => list(&ctx, &mut remote, direction, &events),
-            Job::Migrate { direction, ids, delete, relocate } => {
-                run(&ctx, &mut remote, direction, &ids, delete, relocate, &events)
+            Job::Migrate { direction, sources, delete, relocate } => {
+                run(&ctx, &mut remote, direction, &sources, delete, relocate, &events)
                     .and_then(|()| list(&ctx, &mut remote, direction, &events))
             }
         };
@@ -693,25 +502,25 @@ fn run(
     ctx: &Ctx,
     remote: &mut Remote,
     direction: Direction,
-    ids: &[String],
+    sources: &[Source],
     delete: bool,
     relocate: Option<String>,
     events: &Sender<Event>,
 ) -> anyhow::Result<()> {
     let compression = CompressArgs { algo: None, level: None, threads: None }.resolve(Algo::Zstd)?;
-    let relocate = match relocate.map(|dir| migrate::target(&dir, direction, remote)).transpose() {
-        Ok(relocate) => relocate,
+    let settings = migrate::settings(delete, relocate);
+    let terms = match migrate::terms(&settings, direction, remote, compression) {
+        Ok(terms) => terms,
         Err(err) => {
             let _ = events.send(Event::Log(format!("{err:#}"), BAD));
             return Ok(());
         }
     };
-    let terms = Terms { compression, relocate, delete };
     let mut outbox = Outbox::new(ctx);
     let mut inbox = Inbox::new(ctx);
     let (mut done, mut skipped) = (0, 0);
-    for id in ids {
-        let (status, _) = migrate::one(remote, direction, id, &terms, &mut inbox, &mut outbox)?;
+    for source in sources {
+        let (status, _) = migrate::one(remote, direction, source, &terms, &mut inbox, &mut outbox)?;
         let reason = status.reason().map(|r| format!("  ({r})")).unwrap_or_default();
         let color = if status == Status::Done { OK } else { WARN };
         if status.ok() {
@@ -719,7 +528,10 @@ fn run(
         } else {
             skipped += 1;
         }
-        let _ = events.send(Event::Log(format!("{:<10} {id}{reason}", status.label(Verb::Migrate)), color));
+        let form = if source.packed() { "packed" } else { "live" };
+        let title = clip(if source.title().is_empty() { "(untitled)" } else { source.title() }, 40);
+        let line = format!("{:<10} {form:<6} {}  {title}{reason}", status.label(Verb::Migrate), source.id());
+        let _ = events.send(Event::Log(line, color));
     }
     let _ = events.send(Event::Log(format!("{done} migrated · {skipped} skipped"), ACCENT));
     Ok(())

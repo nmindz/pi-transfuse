@@ -270,6 +270,9 @@ pub struct Scope {
     /// Keep only sessions whose id, title, or path contains this text.
     #[arg(short, long, value_parser = lowercase)]
     pub filter: Option<String>,
+    /// Leave out sessions without a title.
+    #[arg(long)]
+    pub hide_untitled: bool,
 }
 
 impl Scope {
@@ -290,6 +293,7 @@ impl Scope {
         self.include.iter().all(|r| r.matches(facts))
             && !self.exclude.iter().any(|r| r.matches(facts))
             && self.filter.as_deref().is_none_or(|needle| facts.mentions(needle))
+            && (!self.hide_untitled || !facts.title.trim().is_empty())
     }
 }
 
@@ -316,7 +320,24 @@ pub mod tests {
             include: include.iter().map(|r| r.parse().unwrap()).collect(),
             exclude: exclude.iter().map(|r| r.parse().unwrap()).collect(),
             filter: None,
+            hide_untitled: false,
         }
+    }
+
+    #[test]
+    fn hide_untitled_rejects_empty_titles() {
+        let mut bare = facts(Side::Pi, "a", "/w", 0, 0);
+        bare.title.clear();
+        let named = facts(Side::Pi, "b", "/w", 0, 0);
+        let scope = Scope { hide_untitled: true, ..Scope::default() };
+        assert!(!scope.admits(&bare));
+        assert!(scope.admits(&named));
+        let spaced = {
+            let mut f = facts(Side::Pi, "c", "/w", 0, 0);
+            f.title = "   ".into();
+            f
+        };
+        assert!(!scope.admits(&spaced));
     }
 
     #[test]

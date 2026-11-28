@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -41,6 +41,8 @@ pub struct Spec {
     pub now_ms: i64,
     /// Command settings the user can change before confirming.
     pub settings: Vec<Setting>,
+    /// Extra (key, what) rows appended under a blank line in the help overlay.
+    pub extra_keys: Vec<(String, String)>,
 }
 
 /// Value of one command setting the picker lets the user change.
@@ -111,6 +113,7 @@ enum Overlay {
 enum Facet {
     Harness(Side),
     Project(String),
+    Untitled,
 }
 
 struct FacetLine {
@@ -119,8 +122,30 @@ struct FacetLine {
     bytes: u64,
 }
 
+/// Opaque saved view for rebuilding the picker over fresh rows.
+pub struct Keep {
+    selected: HashSet<(String, bool)>,
+    cursor_key: Option<(String, bool)>,
+    sort: Sort,
+    filter: String,
+    threshold: u32,
+    threshold_enabled: bool,
+    hidden_harnesses: HashSet<Side>,
+    hidden_projects: HashSet<String>,
+    hidden_untitled: bool,
+    settings: Vec<Setting>,
+}
+
+fn row_key(row: &Row) -> (String, bool) {
+    (row.facts.id.clone(), row.facts.archive_bytes.is_some())
+}
+
+fn title_empty(facts: &Facts) -> bool {
+    facts.title.trim().is_empty()
+}
+
 // In-memory picker; draw only reads this.
-struct Picker {
+pub struct Picker {
     title: String,
     verb: String,
     headers: Vec<String>,
@@ -131,6 +156,7 @@ struct Picker {
     sort: Sort,
     hidden_harnesses: HashSet<Side>,
     hidden_projects: HashSet<String>,
+    hidden_untitled: bool,
     /// Harnesses then projects present among the rows, for the filter panel.
     facets: Vec<FacetLine>,
     facet_cursor: usize,
@@ -141,17 +167,27 @@ struct Picker {
     filter: String,
     editing_filter: bool,
     settings: Vec<Setting>,
+    extra_keys: Vec<(String, String)>,
     /// Setting whose text is being edited, with the value to restore on Esc.
     editing_setting: Option<(usize, String)>,
     overlay: Overlay,
     status: String,
     status_color: Color,
+    embedded: bool,
     cancelled: bool,
     confirmed: Option<Vec<usize>>,
 }
 
 impl Picker {
-    fn new(spec: Spec) -> Self {
+    pub fn new(spec: Spec) -> Self {
+        Self::from_spec(spec, false)
+    }
+
+    pub fn embedded(spec: Spec) -> Self {
+        Self::from_spec(spec, true)
+    }
+
+    fn from_spec(spec: Spec, embedded: bool) -> Self {
         let n = spec.rows.len();
         let mut picker = Self {
             title: spec.title,
@@ -164,6 +200,7 @@ impl Picker {
             sort: spec.sort,
             hidden_harnesses: HashSet::new(),
             hidden_projects: HashSet::new(),
+            hidden_untitled: false,
             facets: Vec::new(),
             facet_cursor: 0,
             selected: vec![false; n],
@@ -172,15 +209,118 @@ impl Picker {
             filter: String::new(),
             editing_filter: false,
             settings: spec.settings,
+            extra_keys: spec.extra_keys,
             editing_setting: None,
             overlay: Overlay::None,
             status: String::new(),
             status_color: DIM,
+            embedded,
             cancelled: false,
             confirmed: None,
         };
         picker.reindex();
         picker
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.editing_setting.is_some() {
+            setting_key(self, key.code);
+        } else if self.editing_filter {
+            filter_key(self, key.code);
+        } else {
+            match self.overlay {
+                Overlay::Help => self.overlay = Overlay::None,
+                Overlay::Confirm => match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        self.confirmed = Some(self.confirm_candidates());
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => self.overlay = Overlay::None,
+                    _ => {}
+                },
+                Overlay::Filters => facet_key(self, key.code),
+                Overlay::None => list_key(self, key.code),
+            }
+        }
+    }
+
+    pub fn captures_keys(&self) -> bool {
+        self.editing_setting.is_some()
+            || self.editing_filter
+            || !matches!(self.overlay, Overlay::None)
+    }
+
+    pub fn request_confirm(&mut self) {
+        self.request_confirm_inner();
+    }
+
+    pub fn take_confirmed(&mut self) -> Option<Picked> {
+        let rows = self.confirmed.take()?;
+        self.overlay = Overlay::None;
+        Some(Picked { rows, settings: self.settings.clone() })
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>, color: Color) {
+        self.set_status_inner(msg, color);
+    }
+
+    pub fn settings(&self) -> &[Setting] {
+        &self.settings
+    }
+
+    pub fn keep(&self) -> Keep {
+        let selected = self
+            .selected
+            .iter()
+            .enumerate()
+            .filter(|(_, &on)| on)
+            .map(|(i, _)| row_key(&self.rows[i]))
+            .collect();
+        let cursor_key = self.cursor_row_index().map(|i| row_key(&self.rows[i]));
+        Keep {
+            selected,
+            cursor_key,
+            sort: self.sort,
+            filter: self.filter.clone(),
+            threshold: self.threshold,
+            threshold_enabled: self.threshold_enabled,
+            hidden_harnesses: self.hidden_harnesses.clone(),
+            hidden_projects: self.hidden_projects.clone(),
+            hidden_untitled: self.hidden_untitled,
+            settings: self.settings.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, keep: Keep) {
+        self.sort = keep.sort;
+        self.filter = keep.filter;
+        self.threshold = keep.threshold;
+        self.threshold_enabled = keep.threshold_enabled;
+        self.hidden_harnesses = keep.hidden_harnesses;
+        self.hidden_projects = keep.hidden_projects;
+        self.hidden_untitled = keep.hidden_untitled;
+        self.settings = keep.settings;
+        // A row that became blocked, say moved away meanwhile, stays unselected.
+        self.selected = self
+            .rows
+            .iter()
+            .map(|row| row.blocked.is_none() && keep.selected.contains(&row_key(row)))
+            .collect();
+        self.reindex();
+        self.cursor = keep
+            .cursor_key
+            .and_then(|key| self.view.iter().position(|&i| row_key(&self.rows[i]) == key))
+            .unwrap_or_else(|| self.cursor.min(self.view.len().saturating_sub(1)));
+    }
+
+    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+        draw_picker(frame, area, self);
     }
 
     /// Filter, threshold, sort, then keep the cursor on the same row when possible.
@@ -213,7 +353,9 @@ impl Picker {
 
     fn hidden_by_facet(&self, index: usize) -> bool {
         let facts = &self.rows[index].facts;
-        self.hidden_harnesses.contains(&facts.harness) || self.hidden_projects.contains(&facts.project)
+        self.hidden_harnesses.contains(&facts.harness)
+            || self.hidden_projects.contains(&facts.project)
+            || (self.hidden_untitled && title_empty(facts))
     }
 
     fn shown_set(&self) -> HashSet<usize> {
@@ -331,21 +473,27 @@ impl Picker {
         match facet {
             Facet::Harness(side) => !self.hidden_harnesses.contains(side),
             Facet::Project(name) => !self.hidden_projects.contains(name),
+            Facet::Untitled => !self.hidden_untitled,
         }
     }
 
     fn toggle_facet(&mut self) {
-        let Some(line) = self.facets.get(self.facet_cursor) else { return };
+        let Some(line) = self.facets.get(self.facet_cursor) else {
+            return;
+        };
         match &line.facet {
             Facet::Harness(side) => flip(&mut self.hidden_harnesses, *side),
             Facet::Project(name) => flip(&mut self.hidden_projects, name.clone()),
+            Facet::Untitled => self.hidden_untitled = !self.hidden_untitled,
         }
         self.reindex();
     }
 
     /// Shows only the cursor's facet among its kind: one harness, or one project.
     fn only_facet(&mut self) {
-        let Some(line) = self.facets.get(self.facet_cursor) else { return };
+        let Some(line) = self.facets.get(self.facet_cursor) else {
+            return;
+        };
         match &line.facet {
             Facet::Harness(keep) => {
                 self.hidden_harnesses = self
@@ -367,6 +515,7 @@ impl Picker {
                     })
                     .collect();
             }
+            Facet::Untitled => self.toggle_facet(),
         }
         self.reindex();
     }
@@ -374,6 +523,7 @@ impl Picker {
     fn show_all_facets(&mut self) {
         self.hidden_harnesses.clear();
         self.hidden_projects.clear();
+        self.hidden_untitled = false;
         self.reindex();
     }
 
@@ -401,17 +551,20 @@ impl Picker {
             [one] => parts.push(format!("−{one}")),
             many => parts.push(format!("−{} projects", many.len())),
         }
+        if self.hidden_untitled {
+            parts.push("−untitled".into());
+        }
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
-    fn set_status<S: Into<String>>(&mut self, msg: S, color: Color) {
+    fn set_status_inner<S: Into<String>>(&mut self, msg: S, color: Color) {
         self.status = msg.into();
         self.status_color = color;
     }
 
-    fn request_confirm(&mut self) {
+    fn request_confirm_inner(&mut self) {
         if self.confirm_candidates().is_empty() {
-            self.set_status("nothing selected to act on", WARN);
+            self.set_status_inner("nothing selected to act on", WARN);
             return;
         }
         self.overlay = Overlay::Confirm;
@@ -432,8 +585,19 @@ impl Picker {
         }
         let msg = format!("{}: {}", setting.label, setting.shown());
         let color = if setting.warn && setting.active() { WARN } else { DIM };
-        self.set_status(msg, color);
+        self.set_status_inner(msg, color);
         true
+    }
+
+    fn toggle_hidden_untitled(&mut self) {
+        self.hidden_untitled = !self.hidden_untitled;
+        self.reindex();
+        let msg = if self.hidden_untitled {
+            "untitled sessions hidden"
+        } else {
+            "untitled sessions shown"
+        };
+        self.set_status_inner(msg, DIM);
     }
 }
 
@@ -447,6 +611,7 @@ fn flip<T: Eq + std::hash::Hash>(set: &mut HashSet<T>, item: T) {
 fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
     let mut harnesses: BTreeMap<&str, (Side, usize, u64)> = BTreeMap::new();
     let mut projects: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    let mut untitled = (0usize, 0u64);
     for row in rows {
         let f = &row.facts;
         let h = harnesses.entry(f.harness.key()).or_insert((f.harness, 0, 0));
@@ -455,6 +620,10 @@ fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
         let p = projects.entry(f.project.as_str()).or_default();
         p.0 += 1;
         p.1 += f.bytes;
+        if title_empty(f) {
+            untitled.0 += 1;
+            untitled.1 += f.bytes;
+        }
     }
     let mut out: Vec<FacetLine> = crate::facts::ALL_SIDES
         .iter()
@@ -467,6 +636,13 @@ fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
         .collect();
     projects.sort_by_key(|l| std::cmp::Reverse(l.bytes));
     out.extend(projects);
+    if untitled.0 > 0 {
+        out.push(FacetLine {
+            facet: Facet::Untitled,
+            sessions: untitled.0,
+            bytes: untitled.1,
+        });
+    }
     out
 }
 
@@ -482,36 +658,20 @@ pub fn pick(spec: Spec) -> Result<Option<Picked>> {
 fn run_picker(terminal: &mut DefaultTerminal, spec: Spec) -> Result<Option<Picked>> {
     let mut app = Picker::new(spec);
     while !app.cancelled && app.confirmed.is_none() {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| app.draw(frame, frame.area()))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             app.cancelled = true;
-        } else if app.editing_setting.is_some() {
-            setting_key(&mut app, key.code);
-        } else if app.editing_filter {
-            filter_key(&mut app, key.code);
         } else {
-            match app.overlay {
-                Overlay::Help => app.overlay = Overlay::None,
-                Overlay::Confirm => match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => app.confirmed = Some(app.confirm_candidates()),
-                    KeyCode::Char('n') | KeyCode::Esc => app.overlay = Overlay::None,
-                    _ => {}
-                },
-                Overlay::Filters => facet_key(&mut app, key.code),
-                Overlay::None => list_key(&mut app, key.code),
-            }
+            app.handle(key);
         }
     }
     if app.cancelled {
         return Ok(None);
     }
-    Ok(app.confirmed.map(|rows| Picked { rows, settings: app.settings }))
+    Ok(app.take_confirmed())
 }
 
 /// Text editor for one setting: Enter keeps the text, Esc restores the old one.
@@ -572,7 +732,8 @@ fn facet_key(app: &mut Picker, code: KeyCode) {
 fn list_key(app: &mut Picker, code: KeyCode) {
     let last = app.view.len().saturating_sub(1);
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.cancelled = true,
+        KeyCode::Char('q') | KeyCode::Esc if !app.embedded => app.cancelled = true,
+        KeyCode::Char('q') | KeyCode::Esc => {}
         KeyCode::Char('j') | KeyCode::Down => app.cursor = (app.cursor + 1).min(last),
         KeyCode::Char('k') | KeyCode::Up => app.cursor = app.cursor.saturating_sub(1),
         KeyCode::PageDown => app.cursor = (app.cursor + 10).min(last),
@@ -591,8 +752,13 @@ fn list_key(app: &mut Picker, code: KeyCode) {
         KeyCode::Char('f') => app.overlay = Overlay::Filters,
         KeyCode::Char('[') => app.step_threshold(false),
         KeyCode::Char(']') => app.step_threshold(true),
-        KeyCode::Enter => app.request_confirm(),
+        KeyCode::Enter => app.request_confirm_inner(),
         KeyCode::Char('?') => app.overlay = Overlay::Help,
+        KeyCode::Char('U') => {
+            if !app.press_setting('U') {
+                app.toggle_hidden_untitled();
+            }
+        }
         KeyCode::Char(c) => {
             if app.press_setting(c) {
                 return;
@@ -606,8 +772,7 @@ fn list_key(app: &mut Picker, code: KeyCode) {
 }
 
 // Ratatui panes; colors match `crate::tui`.
-fn draw(frame: &mut Frame, app: &Picker) {
-    let area = frame.area();
+fn draw_picker(frame: &mut Frame, area: Rect, app: &Picker) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(1), Constraint::Length(1)])
@@ -802,7 +967,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &Picker) {
 fn draw_status(frame: &mut Frame, area: Rect, app: &Picker) {
     let (msg, color) = if app.status.is_empty() {
         let mut hint = String::from("j/k move · space toggle · a all · / search · f filters · ");
-        hint.push_str("u s n d sort · enter confirm · q quit");
+        hint.push_str("U hide untitled · u s n d sort · enter confirm · ");
+        if app.embedded {
+            hint.push_str("? keys");
+        } else {
+            hint.push_str("q quit");
+        }
         for setting in &app.settings {
             hint.push_str(&format!(" · {} {}", setting.key, setting.label));
         }
@@ -824,7 +994,8 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &Picker) {
         ("a / A", "select or deselect every shown row / clear all"),
         ("p", "toggle every shown row in this path"),
         ("/", "filter by id, title, or path"),
-        ("f", "show or hide harnesses and projects"),
+        ("f", "show or hide harnesses, projects, and untitled"),
+        ("U", "hide or show sessions without a title"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -842,7 +1013,16 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &Picker) {
         };
         rows.push((setting.key.to_string(), format!("{verb} {}", setting.label)));
     }
-    rows.extend([("enter".into(), "confirm selection".into()), ("? / q".into(), "this help / cancel".into())]);
+    rows.extend([("enter".into(), "confirm selection".into())]);
+    if app.embedded {
+        rows.push(("?".into(), "this help".into()));
+    } else {
+        rows.push(("? / q".into(), "this help / cancel".into()));
+    }
+    if !app.extra_keys.is_empty() {
+        rows.push((String::new(), String::new()));
+        rows.extend(app.extra_keys.iter().cloned());
+    }
     let lines: Vec<Line> = rows
         .iter()
         .map(|(key, what)| {
@@ -865,6 +1045,7 @@ fn draw_filters(frame: &mut Frame, area: Rect, app: &Picker) {
         let (heading, name) = match &line.facet {
             Facet::Harness(side) => ("harness", side.key().to_string()),
             Facet::Project(name) => ("project", name.clone()),
+            Facet::Untitled => ("title", "(untitled)".to_string()),
         };
         if heading != section {
             section = heading;
@@ -985,7 +1166,19 @@ mod tests {
             sort: Sort { key: SortKey::Used, reverse: false },
             now_ms: NOW,
             settings,
+            extra_keys: Vec::new(),
         })
+    }
+
+    fn row_named(id: &str, title: &str) -> Row {
+        let mut f = facts(Side::Pi, id, "/w/p", 50, 10);
+        f.title = title.into();
+        Row {
+            columns: vec![id.into()],
+            facts: f,
+            details: Vec::new(),
+            blocked: None,
+        }
     }
 
     fn setting(key: char, label: &str, value: Value) -> Setting {
@@ -1170,6 +1363,88 @@ mod tests {
         p.filter = "you".into();
         p.reindex();
         assert_eq!(listed(&p), vec![(Facet::Harness(Side::Claude), 1), (Facet::Project("beta".into()), 1)]);
+    }
+
+    #[test]
+    fn u_hides_untitled_rows_and_the_facet_line_counts_them() {
+        let rows = vec![
+            row_named("titled", "has title"),
+            row_named("blank", ""),
+            row_named("spaces", "  "),
+        ];
+        let mut p = picker(rows, None);
+        let untitled_line = p
+            .facets
+            .iter()
+            .find(|l| l.facet == Facet::Untitled)
+            .expect("untitled facet when some rows lack titles");
+        assert_eq!((untitled_line.sessions, untitled_line.bytes), (2, 20));
+        list_key(&mut p, KeyCode::Char('U'));
+        assert!(p.hidden_untitled);
+        assert_eq!(shown_ids(&p), vec!["titled"]);
+        list_key(&mut p, KeyCode::Char('U'));
+        let mut back = shown_ids(&p).into_iter().map(str::to_string).collect::<Vec<_>>();
+        back.sort();
+        assert_eq!(back, vec!["blank", "spaces", "titled"]);
+    }
+
+    #[test]
+    fn embedded_ignores_q_and_esc_in_list_mode() {
+        let mut p = Picker::embedded(Spec {
+            title: "host".into(),
+            verb: "pull".into(),
+            headers: vec!["id".into()],
+            rows: vec![row(Side::Pi, "a", "/w", 50, 1, false)],
+            threshold_days: None,
+            sort: Sort { key: SortKey::Used, reverse: false },
+            now_ms: NOW,
+            settings: Vec::new(),
+            extra_keys: Vec::new(),
+        });
+        list_key(&mut p, KeyCode::Char('q'));
+        assert!(!p.cancelled);
+        list_key(&mut p, KeyCode::Esc);
+        assert!(!p.cancelled);
+    }
+
+    #[test]
+    fn keep_and_restore_carry_view_state_across_rebuilt_rows() {
+        let first = vec![
+            row(Side::Pi, "stay", "/w/alpha", 50, 1, false),
+            row(Side::Pi, "gone", "/w/beta", 50, 1, false),
+        ];
+        let mut p = picker(first, None);
+        p.selected = vec![true, false];
+        p.facet_cursor = p.facets.iter().position(|l| l.facet == Facet::Project("beta".into())).unwrap();
+        p.toggle_facet();
+        let kept = p.keep();
+        let second = vec![
+            row(Side::Pi, "stay", "/w/alpha", 50, 1, false),
+            row(Side::Pi, "new", "/w/gamma", 50, 1, false),
+        ];
+        let mut p2 = picker(second, None);
+        p2.restore(kept);
+        assert_eq!(p2.selected, vec![true, false]);
+        assert!(p2.hidden_projects.contains("beta"));
+        assert!(shown_ids(&p2).contains(&"stay"));
+        assert!(shown_ids(&p2).contains(&"new"));
+        p2.cursor = 0;
+        p2.toggle_at_cursor();
+        assert_eq!(p2.selected, vec![false, false]);
+    }
+
+    #[test]
+    fn take_confirmed_returns_once_and_closes_the_overlay() {
+        let mut p = picker(vec![row(Side::Pi, "a", "/w", 50, 1, false)], None);
+        p.selected[0] = true;
+        p.request_confirm();
+        // A host polls after every key; the open dialog must survive that.
+        assert!(p.take_confirmed().is_none());
+        assert!(matches!(p.overlay, Overlay::Confirm));
+        p.handle(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        assert_eq!(p.take_confirmed().map(|x| x.rows), Some(vec![0]));
+        assert!(p.take_confirmed().is_none());
+        assert!(matches!(p.overlay, Overlay::None));
     }
 
     #[test]

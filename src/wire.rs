@@ -17,26 +17,28 @@ use serde::{Deserialize, Serialize};
 use crate::archive::{self, Algo, Compression, System};
 use crate::askpass;
 use crate::transfer::{self, Inbox, Meter, Outbox, Progress};
+use crate::compact::Local;
 use crate::units::{Ctx, Status, Unit};
 
 /// Bumped whenever a message changes shape.
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 /// Lines a remote shell may print before the greeting, from noisy rc files.
 const NOISE_LIMIT: usize = 200;
 
-/// What the local run asks of the remote host.
+/// What the local run asks of the remote host. `packed` names the session
+/// packed in place rather than the live one of the same id.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Request {
     List,
     /// Resolve a relocation target there.
     Target { dir: String },
-    /// Pack a session and send it.
-    Pack { id: String, algo: Algo, level: i32 },
-    /// The session arrived; drop the sent archive, and the session with `delete`.
-    Release { id: String, delete: bool },
-    /// Take the archive of `size` bytes that follows.
-    Accept { id: String, size: u64, sha256: String, relocate: Option<String> },
+    /// Send a session: live ones packed with this compression, packed ones as they are.
+    Pack { id: String, packed: bool, algo: Algo, level: i32 },
+    /// The session arrived; let go of it, and remove it with `delete`.
+    Release { id: String, packed: bool, delete: bool },
+    /// Take the archive of `size` bytes that follows, restored or kept packed.
+    Accept { id: String, packed: bool, size: u64, sha256: String, relocate: Option<String> },
     Bye,
 }
 
@@ -45,7 +47,7 @@ pub enum Request {
 #[serde(tag = "reply", rename_all = "camelCase")]
 pub enum Reply {
     Hello { protocol: u32, system: System, pi_root: String },
-    Listing { units: Vec<Unit>, held: Vec<String> },
+    Listing { units: Vec<Unit>, packed: Vec<Local>, held: Vec<String> },
     Target { cwd: String },
     /// `size` archive bytes follow.
     Offer { size: u64, sha256: String },
@@ -55,6 +57,14 @@ pub enum Reply {
     Kept { reason: String },
     Placed { path: String, cwd: String },
     Error { message: String },
+}
+
+/// What the remote host holds: live sessions, sessions packed in place, and
+/// the live ones a running omp has open.
+pub struct Listing {
+    pub units: Vec<Unit>,
+    pub packed: Vec<Local>,
+    pub held: HashSet<String>,
 }
 
 fn send<T: Serialize>(out: &mut impl Write, message: &T) -> Result<()> {
@@ -86,17 +96,18 @@ pub fn serve(ctx: &Ctx) -> Result<i32> {
             Request::Bye => break,
             Request::List => {
                 let units = outbox.units().to_vec();
+                let packed = outbox.packed().to_vec();
                 let ids: Vec<String> = units.iter().map(|u| u.id.clone()).collect();
                 let held = outbox.held(&ids).into_iter().collect();
-                Reply::Listing { units, held }
+                Reply::Listing { units, packed, held }
             }
             Request::Target { dir } => match Inbox::target(&dir) {
                 Ok(cwd) => Reply::Target { cwd },
                 Err(err) => Reply::Error { message: format!("{err:#}") },
             },
-            Request::Pack { id, algo, level } => {
+            Request::Pack { id, packed, algo, level } => {
                 let threads = if algo == Algo::Zstd { archive::all_cores() } else { 0 };
-                match outbox.pack(&id, Compression { algo, level, threads }) {
+                match outbox.pack(&id, packed, Compression { algo, level, threads }) {
                     Ok(offer) => {
                         send(&mut output, &Reply::Offer { size: offer.size, sha256: offer.sha256 })?;
                         let mut file = File::open(&offer.path)?;
@@ -107,14 +118,14 @@ pub fn serve(ctx: &Ctx) -> Result<i32> {
                     Err(status) => Reply::Refused { status },
                 }
             }
-            Request::Release { id, delete } => match outbox.release(&id, delete) {
+            Request::Release { id, packed, delete } => match outbox.release(&id, packed, delete) {
                 Ok(freed) => Reply::Released { freed },
                 Err(reason) => Reply::Kept { reason },
             },
-            Request::Accept { id, size, sha256, relocate } => {
+            Request::Accept { id, packed, size, sha256, relocate } => {
                 // A stream that breaks mid-archive cannot be resynchronized.
                 let received = inbox.receive(&mut input, size, &mut Meter::off())?;
-                match inbox.settle(received, &id, &sha256, relocate.as_deref()) {
+                match inbox.settle(received, &id, &sha256, relocate.as_deref(), packed) {
                     Ok(placed) => Reply::Placed { path: placed.path.display().to_string(), cwd: placed.cwd },
                     Err(status) => Reply::Refused { status },
                 }
@@ -355,10 +366,11 @@ impl Remote {
         self.recv()
     }
 
-    /// Every OMP session there, and which a running omp holds.
-    pub fn list(&mut self) -> Result<(Vec<Unit>, HashSet<String>)> {
+    /// Every OMP session there, live or packed in place, and which live ones
+    /// a running omp holds.
+    pub fn list(&mut self) -> Result<Listing> {
         match self.call(&Request::List)? {
-            Reply::Listing { units, held } => Ok((units, held.into_iter().collect())),
+            Reply::Listing { units, packed, held } => Ok(Listing { units, packed, held: held.into_iter().collect() }),
             other => unexpected(other),
         }
     }
@@ -372,11 +384,12 @@ impl Remote {
         }
     }
 
-    /// Brings session `id` here. An `Err` broke the connection; a `Status`
-    /// is this session's outcome. Returns the archive size too.
-    pub fn fetch(&mut self, id: &str, terms: &Terms, inbox: &mut Inbox) -> Result<(Status, u64)> {
-        let pack = Request::Pack { id: id.into(), algo: terms.compression.algo, level: terms.compression.level };
-        let (size, sha256) = match self.call(&pack)? {
+    /// Brings session `id` here, the packed copy when `packed`. An `Err`
+    /// broke the connection; a `Status` is this session's outcome. Returns
+    /// the archive size too.
+    pub fn fetch(&mut self, id: &str, packed: bool, terms: &Terms, inbox: &mut Inbox) -> Result<(Status, u64)> {
+        let (algo, level) = (terms.compression.algo, terms.compression.level);
+        let (size, sha256) = match self.call(&Request::Pack { id: id.into(), packed, algo, level })? {
             Reply::Offer { size, sha256 } => (size, sha256),
             Reply::Refused { status } => return Ok((status, 0)),
             other => return unexpected(other),
@@ -385,34 +398,35 @@ impl Remote {
             let mut meter = Meter::new(id, size, self.progress.as_deref_mut());
             inbox.receive(&mut self.input, size, &mut meter)?
         };
-        if let Err(status) = inbox.settle(received, id, &sha256, terms.relocate.as_deref()) {
-            let _ = self.release(id, false)?;
+        if let Err(status) = inbox.settle(received, id, &sha256, terms.relocate.as_deref(), packed) {
+            let _ = self.release(id, packed, false)?;
             return Ok((status, size));
         }
-        let status = match self.release(id, terms.delete)? {
+        let status = match self.release(id, packed, terms.delete)? {
             Ok(_) => Status::Done,
             Err(reason) => Status::Failed(format!("arrived, but the source stays: {reason}")),
         };
         Ok((status, size))
     }
 
-    fn release(&mut self, id: &str, delete: bool) -> Result<Result<u64, String>> {
-        match self.call(&Request::Release { id: id.into(), delete })? {
+    fn release(&mut self, id: &str, packed: bool, delete: bool) -> Result<Result<u64, String>> {
+        match self.call(&Request::Release { id: id.into(), packed, delete })? {
             Reply::Released { freed } => Ok(Ok(freed)),
             Reply::Kept { reason } => Ok(Err(reason)),
             other => unexpected(other),
         }
     }
 
-    /// Sends session `id` there, then lets the local copy go: removed when
-    /// `terms.delete` once the remote host has restored it.
-    pub fn deliver(&mut self, id: &str, terms: &Terms, outbox: &mut Outbox) -> Result<(Status, u64)> {
-        let offer = match outbox.pack(id, terms.compression) {
+    /// Sends session `id` there, the packed copy when `packed`, then lets the
+    /// local one go: removed when `terms.delete` once the remote host has it.
+    pub fn deliver(&mut self, id: &str, packed: bool, terms: &Terms, outbox: &mut Outbox) -> Result<(Status, u64)> {
+        let offer = match outbox.pack(id, packed, terms.compression) {
             Ok(offer) => offer,
             Err(status) => return Ok((status, 0)),
         };
         let accept = Request::Accept {
             id: id.into(),
+            packed,
             size: offer.size,
             sha256: offer.sha256.clone(),
             relocate: terms.relocate.clone(),
@@ -429,14 +443,14 @@ impl Remote {
         }
         match self.recv()? {
             Reply::Placed { .. } => {
-                let status = match outbox.release(id, terms.delete) {
+                let status = match outbox.release(id, packed, terms.delete) {
                     Ok(_) => Status::Done,
                     Err(reason) => Status::Failed(format!("arrived, but the source stays: {reason}")),
                 };
                 Ok((status, offer.size))
             }
             Reply::Refused { status } => {
-                let _ = outbox.release(id, false);
+                let _ = outbox.release(id, packed, false);
                 Ok((status, offer.size))
             }
             other => unexpected(other),

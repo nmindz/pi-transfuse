@@ -213,6 +213,76 @@ fn a_session_open_at_the_source_stays_put() {
     assert!(files(&hosts.sessions("local")).is_empty());
 }
 
+/// A session packed in place travels as its archive and lands packed; the
+/// project and untitled filters narrow what `--yes` takes.
+#[test]
+fn packed_sessions_travel_packed_and_filters_narrow_the_choice() {
+    let hosts = Hosts::new();
+    let (proj, other) = (hosts.work("proj"), hosts.work("new"));
+    hosts.session("remote", "p1", &proj);
+    hosts.session("remote", "o1", &other);
+    let untitled = hosts.session("remote", "u1", &proj);
+    let text = fs::read_to_string(&untitled).unwrap().replacen("\"title u1\"", "\"\"", 1);
+    fs::write(&untitled, text).unwrap();
+    let packed = Command::new(BIN)
+        .args(["compact", "pack", "p1", "--older-than", "0d"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", hosts.dir.join("home"))
+        .env("OMP_HOME", hosts.dir.join("remote"))
+        .output()
+        .unwrap();
+    assert!(packed.status.success(), "{}", String::from_utf8_lossy(&packed.stderr));
+    let bucket = Hosts::bucket(&proj);
+    let archive = format!("{STAMP}_p1.tar.gz");
+    let bytes = fs::read(hosts.sessions("remote").join(&bucket).join(&archive)).unwrap();
+
+    let out = hosts.run(&["migrate", "pull", "box", "--yes", "--include", "project=proj", "--hide-untitled", "--delete"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("p1") && !stdout.contains("o1") && !stdout.contains("u1"), "{stdout}");
+    assert_eq!(fs::read(hosts.sessions("local").join(&bucket).join(&archive)).unwrap(), bytes);
+    assert!(!hosts.transcript("local", "p1", &proj).exists());
+    assert!(!hosts.sessions("remote").join(&bucket).join(&archive).exists());
+    assert!(hosts.transcript("remote", "u1", &proj).exists() && hosts.transcript("remote", "o1", &other).exists());
+
+    let again = hosts.run(&["migrate", "push", "box", "p1"]);
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(fs::read(hosts.sessions("remote").join(&bucket).join(&archive)).unwrap(), bytes);
+    hosts.assert_clean();
+}
+
+/// A packed session relocated on the way lands packed in the new bucket, and
+/// unpacks there with its cwd rewritten.
+#[test]
+fn a_relocated_packed_session_is_repacked_into_its_new_bucket() {
+    let hosts = Hosts::new();
+    let (proj, new) = (hosts.work("proj"), hosts.work("new"));
+    hosts.session("remote", "r1", &proj);
+    let omp = |home: &str, args: &[&str]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", hosts.dir.join("home"))
+            .env("OMP_HOME", hosts.dir.join(home))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    omp("remote", &["compact", "pack", "r1", "--older-than", "0d"]);
+
+    let out = hosts.run(&["migrate", "pull", "box", "r1", "--relocate", &new]);
+    assert_eq!(out.status.code(), Some(0));
+    let archive = hosts.sessions("local").join(Hosts::bucket(&new)).join(format!("{STAMP}_r1.tar.gz"));
+    assert!(archive.exists());
+    omp("local", &["compact", "unpack", "r1"]);
+    let landed = hosts.transcript("local", "r1", &new);
+    assert_eq!(header(&landed)["cwd"], json!(new));
+    assert_eq!(header(&landed.with_extension("").join("agents/sub.jsonl"))["cwd"], json!(new));
+    hosts.assert_clean();
+}
+
 /// As sshd does: the login shell runs the command with `-c`, in a bare
 /// environment, so only rc files a non-interactive shell reads apply.
 #[test]

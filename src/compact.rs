@@ -80,7 +80,8 @@ pub fn run(ctx: &Ctx, command: Command) -> Result<i32> {
 }
 
 /// A session packed in place.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Local {
     pub path: PathBuf,
     pub manifest: Manifest,
