@@ -187,12 +187,13 @@ fn list(ctx: &Ctx, args: &ListArgs, host: &str) -> Result<i32> {
     let mut remote = Remote::connect(host, &args.ssh, Launch::default())?;
     let listing = remote.list()?;
     let (host, root) = (remote.host.clone(), PathBuf::from(&remote.pi_root));
+    let scope = args.scope.on_host(&remote.home);
     drop(remote);
     let here = Inbox::new(ctx).present().clone();
     let all = sources(listing.units, listing.packed);
     let old_enough = |f: &Facts| args.older_than.is_none_or(|age| units::age_days(ctx.now_ms, f.last_used_ms) >= age.days);
     let mut shown: Vec<(Facts, &Source)> =
-        all.iter().map(|s| (s.facts(), s)).filter(|(f, _)| args.scope.admits(f) && old_enough(f)).collect();
+        all.iter().map(|s| (s.facts(), s)).filter(|(f, _)| scope.admits(f) && old_enough(f)).collect();
     let sort = args.sort.resolve(SortKey::Used);
     shown.sort_by(|(a, _), (b, _)| sort.compare(a, b));
     let held = &listing.held;
@@ -264,6 +265,8 @@ pub struct Plan {
     present: HashSet<String>,
     pub from: String,
     pub to: String,
+    /// Home of the sending host, which its sessions' paths sit under.
+    pub home: String,
 }
 
 pub fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inbox, direction: Direction) -> Result<Plan> {
@@ -277,6 +280,7 @@ pub fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inb
             present: inbox.present().clone(),
             from: host,
             to: "this host".into(),
+            home: remote.home.clone(),
         },
         Direction::Push => {
             let units = outbox.units().to_vec();
@@ -289,6 +293,7 @@ pub fn plan(ctx: &Ctx, remote: &mut Remote, outbox: &mut Outbox, inbox: &mut Inb
                 present: present.chain(listing.packed.into_iter().map(|l| l.manifest.id)).collect(),
                 from: "this host".into(),
                 to: host,
+                home: crate::paths::home().display().to_string(),
             }
         }
     })
@@ -376,7 +381,10 @@ fn migrate(ctx: &Ctx, args: &MoveArgs, host: &str, direction: Direction) -> Resu
         now_ms: ctx.now_ms,
     };
     let mut settings = settings(args.delete, args.relocate.clone());
-    let chosen = units::choose_with(candidates, &args.act, &args.scope, choice, &mut settings)?;
+    // Path filters name directories of the sending host.
+    let remote_scope = args.scope.on_host(&remote.home);
+    let scope = if direction == Direction::Pull { &remote_scope } else { &args.scope };
+    let chosen = units::choose_with(candidates, &args.act, scope, choice, &mut settings)?;
     if chosen.is_empty() {
         println!("nothing chosen");
         return Ok(0);

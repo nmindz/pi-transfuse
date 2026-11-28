@@ -46,7 +46,14 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "camelCase")]
 pub enum Reply {
-    Hello { protocol: u32, system: System, pi_root: String },
+    /// `home` lets path filters resolve `~` on that host.
+    Hello {
+        protocol: u32,
+        system: System,
+        pi_root: String,
+        #[serde(default)]
+        home: String,
+    },
     Listing { units: Vec<Unit>, packed: Vec<Local>, held: Vec<String> },
     Target { cwd: String },
     /// `size` archive bytes follow.
@@ -88,7 +95,8 @@ pub fn serve(ctx: &Ctx) -> Result<i32> {
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = BufWriter::new(io::stdout().lock());
     let pi_root = ctx.roots.pi.display().to_string();
-    send(&mut output, &Reply::Hello { protocol: PROTOCOL, system: ctx.system.clone(), pi_root })?;
+    let home = crate::paths::home().display().to_string();
+    send(&mut output, &Reply::Hello { protocol: PROTOCOL, system: ctx.system.clone(), pi_root, home })?;
     let mut outbox = Outbox::new(ctx);
     let mut inbox = Inbox::new(ctx);
     while let Some(request) = recv::<Request>(&mut input)? {
@@ -272,6 +280,8 @@ pub struct Remote {
     pub host: String,
     pub system: System,
     pub pi_root: String,
+    /// The remote user's home, for path filters given with `~`.
+    pub home: String,
     child: Child,
     input: BufReader<ChildStdout>,
     /// `None` once closed, which ends the remote side.
@@ -310,15 +320,17 @@ impl Remote {
             host: host.to_string(),
             system: System::current(),
             pi_root: String::new(),
+            home: String::new(),
             child,
             input,
             output: Some(output),
             progress: launch.progress,
         };
         match remote.greeting() {
-            Ok((system, pi_root)) => {
+            Ok((system, pi_root, home)) => {
                 remote.system = system;
                 remote.pi_root = pi_root;
+                remote.home = home;
                 Ok(remote)
             }
             Err(err) => {
@@ -333,7 +345,7 @@ impl Remote {
         }
     }
 
-    fn greeting(&mut self) -> Result<(System, String)> {
+    fn greeting(&mut self) -> Result<(System, String, String)> {
         for _ in 0..NOISE_LIMIT {
             let mut line = String::new();
             if self.input.read_line(&mut line)? == 0 {
@@ -341,7 +353,9 @@ impl Remote {
             }
             let Ok(reply) = serde_json::from_str::<Reply>(&line) else { continue };
             return match reply {
-                Reply::Hello { protocol, system, pi_root } if protocol == PROTOCOL => Ok((system, pi_root)),
+                Reply::Hello { protocol, system, pi_root, home } if protocol == PROTOCOL => {
+                    Ok((system, pi_root, home))
+                }
                 Reply::Hello { protocol, system, .. } => bail!(
                     "{} speaks migration protocol {protocol}, this one {PROTOCOL}; install the same version on both hosts",
                     system.tool

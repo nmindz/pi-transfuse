@@ -43,6 +43,9 @@ pub struct Spec {
     pub settings: Vec<Setting>,
     /// Extra (key, what) rows appended under a blank line in the help overlay.
     pub extra_keys: Vec<(String, String)>,
+    /// Home of the host the rows' paths belong to, shown as `~`; this host's
+    /// when `None`.
+    pub home: Option<String>,
 }
 
 /// Value of one command setting the picker lets the user change.
@@ -113,6 +116,8 @@ enum Overlay {
 enum Facet {
     Harness(Side),
     Project(String),
+    /// A directory holding several session paths; hides or keeps all below it.
+    Path(String),
     Untitled,
 }
 
@@ -133,6 +138,8 @@ pub struct Keep {
     hidden_harnesses: HashSet<Side>,
     hidden_projects: HashSet<String>,
     hidden_untitled: bool,
+    hidden_paths: HashSet<String>,
+    only_paths: HashSet<String>,
     settings: Vec<Setting>,
 }
 
@@ -157,8 +164,17 @@ pub struct Picker {
     hidden_harnesses: HashSet<Side>,
     hidden_projects: HashSet<String>,
     hidden_untitled: bool,
-    /// Harnesses then projects present among the rows, for the filter panel.
+    /// Directories whose sessions are hidden, at any depth below.
+    hidden_paths: HashSet<String>,
+    /// When any, only sessions at or below one of these directories show.
+    only_paths: HashSet<String>,
+    /// Harnesses, projects, paths and untitled present among the rows.
     facets: Vec<FacetLine>,
+    /// What is typed in the filter panel; narrows its lines by fuzzy match.
+    facet_query: String,
+    /// Indices into `facets` the query leaves, best match first per section.
+    facet_view: Vec<usize>,
+    /// Position in `facet_view`.
     facet_cursor: usize,
     selected: Vec<bool>,
     /// Indices into `rows` in display order.
@@ -168,6 +184,7 @@ pub struct Picker {
     editing_filter: bool,
     settings: Vec<Setting>,
     extra_keys: Vec<(String, String)>,
+    home: String,
     /// Setting whose text is being edited, with the value to restore on Esc.
     editing_setting: Option<(usize, String)>,
     overlay: Overlay,
@@ -201,7 +218,11 @@ impl Picker {
             hidden_harnesses: HashSet::new(),
             hidden_projects: HashSet::new(),
             hidden_untitled: false,
+            hidden_paths: HashSet::new(),
+            only_paths: HashSet::new(),
             facets: Vec::new(),
+            facet_query: String::new(),
+            facet_view: Vec::new(),
             facet_cursor: 0,
             selected: vec![false; n],
             view: Vec::new(),
@@ -210,6 +231,7 @@ impl Picker {
             editing_filter: false,
             settings: spec.settings,
             extra_keys: spec.extra_keys,
+            home: spec.home.unwrap_or_else(|| crate::paths::home().display().to_string()),
             editing_setting: None,
             overlay: Overlay::None,
             status: String::new(),
@@ -240,7 +262,7 @@ impl Picker {
                     KeyCode::Char('n') | KeyCode::Esc => self.overlay = Overlay::None,
                     _ => {}
                 },
-                Overlay::Filters => facet_key(self, key.code),
+                Overlay::Filters => facet_key(self, key),
                 Overlay::None => list_key(self, key.code),
             }
         }
@@ -293,6 +315,8 @@ impl Picker {
             hidden_harnesses: self.hidden_harnesses.clone(),
             hidden_projects: self.hidden_projects.clone(),
             hidden_untitled: self.hidden_untitled,
+            hidden_paths: self.hidden_paths.clone(),
+            only_paths: self.only_paths.clone(),
             settings: self.settings.clone(),
         }
     }
@@ -305,6 +329,8 @@ impl Picker {
         self.hidden_harnesses = keep.hidden_harnesses;
         self.hidden_projects = keep.hidden_projects;
         self.hidden_untitled = keep.hidden_untitled;
+        self.hidden_paths = keep.hidden_paths;
+        self.only_paths = keep.only_paths;
         self.settings = keep.settings;
         // A row that became blocked, say moved away meanwhile, stays unselected.
         self.selected = self
@@ -328,11 +354,9 @@ impl Picker {
     fn reindex(&mut self) {
         let needle = self.filter.to_lowercase();
         let eligible: Vec<usize> = (0..self.rows.len()).filter(|&i| self.eligible(i, &needle)).collect();
-        let old_facet = self.facets.get(self.facet_cursor).map(|l| l.facet.clone());
+        let old_facet = self.facet_at_cursor().map(|l| l.facet.clone());
         self.facets = facets(eligible.iter().map(|&i| &self.rows[i]));
-        self.facet_cursor = old_facet
-            .and_then(|f| self.facets.iter().position(|l| l.facet == f))
-            .unwrap_or_else(|| self.facet_cursor.min(self.facets.len().saturating_sub(1)));
+        self.refacet(old_facet);
 
         let mut indices: Vec<usize> = eligible.into_iter().filter(|&i| !self.hidden_by_facet(i)).collect();
         indices.sort_by(|&a, &b| self.sort.compare(&self.rows[a].facts, &self.rows[b].facts));
@@ -356,6 +380,39 @@ impl Picker {
         self.hidden_harnesses.contains(&facts.harness)
             || self.hidden_projects.contains(&facts.project)
             || (self.hidden_untitled && title_empty(facts))
+            || self.hidden_paths.iter().any(|dir| under(&facts.path, dir))
+            || (!self.only_paths.is_empty() && !self.only_paths.iter().any(|dir| under(&facts.path, dir)))
+    }
+
+    /// Narrows the panel's lines to the query and keeps the cursor on `keep`
+    /// when it is still listed.
+    fn refacet(&mut self, keep: Option<Facet>) {
+        let mut view: Vec<(usize, usize, usize)> = self
+            .facets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let texts = self.facet_texts(&line.facet);
+                let score = texts.iter().filter_map(|t| fuzzy(t, &self.facet_query)).min()?;
+                Some((facet_rank(&line.facet), score, i))
+            })
+            .collect();
+        view.sort_unstable();
+        self.facet_view = view.into_iter().map(|(_, _, i)| i).collect();
+        self.facet_cursor = keep
+            .and_then(|f| self.facet_view.iter().position(|&i| self.facets[i].facet == f))
+            .unwrap_or_else(|| self.facet_cursor.min(self.facet_view.len().saturating_sub(1)));
+    }
+
+    fn facet_at_cursor(&self) -> Option<&FacetLine> {
+        self.facet_view.get(self.facet_cursor).and_then(|&i| self.facets.get(i))
+    }
+
+    /// Changes the panel's query; the cursor goes to the best match.
+    fn edit_facet_query(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.facet_query);
+        self.facet_cursor = 0;
+        self.refacet(None);
     }
 
     fn shown_set(&self) -> HashSet<usize> {
@@ -473,49 +530,90 @@ impl Picker {
         match facet {
             Facet::Harness(side) => !self.hidden_harnesses.contains(side),
             Facet::Project(name) => !self.hidden_projects.contains(name),
+            Facet::Path(dir) => {
+                !self.hidden_paths.iter().any(|h| under(dir, h))
+                    && (self.only_paths.is_empty() || self.only_paths.iter().any(|o| under(dir, o)))
+            }
             Facet::Untitled => !self.hidden_untitled,
         }
     }
 
     fn toggle_facet(&mut self) {
-        let Some(line) = self.facets.get(self.facet_cursor) else {
+        let Some(facet) = self.facet_at_cursor().map(|l| l.facet.clone()) else {
             return;
         };
-        match &line.facet {
-            Facet::Harness(side) => flip(&mut self.hidden_harnesses, *side),
-            Facet::Project(name) => flip(&mut self.hidden_projects, name.clone()),
+        match facet {
+            Facet::Harness(side) => flip(&mut self.hidden_harnesses, side),
+            Facet::Project(name) => flip(&mut self.hidden_projects, name),
+            Facet::Path(dir) => {
+                if self.facet_shown(&Facet::Path(dir.clone())) {
+                    if !self.only_paths.remove(&dir) {
+                        self.hidden_paths.insert(dir);
+                    }
+                } else {
+                    self.hidden_paths.retain(|h| !under(&dir, h));
+                    if !self.only_paths.is_empty() && !self.only_paths.iter().any(|o| under(&dir, o)) {
+                        self.only_paths.insert(dir);
+                    }
+                }
+            }
             Facet::Untitled => self.hidden_untitled = !self.hidden_untitled,
         }
         self.reindex();
     }
 
-    /// Shows only the cursor's facet among its kind: one harness, or one project.
+    /// Shows only the cursor's facet among its kind: one harness, one
+    /// project, or the sessions under one directory.
     fn only_facet(&mut self) {
-        let Some(line) = self.facets.get(self.facet_cursor) else {
+        let Some(facet) = self.facet_at_cursor().map(|l| l.facet.clone()) else {
             return;
         };
-        match &line.facet {
-            Facet::Harness(keep) => {
-                self.hidden_harnesses = self
-                    .facets
-                    .iter()
-                    .filter_map(|l| match l.facet {
-                        Facet::Harness(side) if side != *keep => Some(side),
-                        _ => None,
-                    })
+        self.only_matching(|f| *f == facet);
+    }
+
+    /// Shows only the lines the query matches, among the cursor's kind.
+    fn only_matches(&mut self) {
+        let Some(rank) = self.facet_at_cursor().map(|l| facet_rank(&l.facet)) else {
+            return;
+        };
+        let matched: Vec<Facet> = self
+            .facet_view
+            .iter()
+            .map(|&i| self.facets[i].facet.clone())
+            .filter(|f| facet_rank(f) == rank)
+            .collect();
+        self.only_matching(|f| matched.contains(f));
+    }
+
+    /// Hides every line of `keep`'s kind that `keep` rejects; for paths, keeps
+    /// only the sessions under the accepted directories.
+    fn only_matching(&mut self, keep: impl Fn(&Facet) -> bool) {
+        let Some(rank) = self.facets.iter().find(|l| keep(&l.facet)).map(|l| facet_rank(&l.facet)) else {
+            return;
+        };
+        let kind = self.facets.iter().map(|l| &l.facet).filter(|f| facet_rank(f) == rank);
+        match rank {
+            0 => {
+                self.hidden_harnesses = kind
+                    .filter(|f| !keep(f))
+                    .filter_map(|f| if let Facet::Harness(side) = f { Some(*side) } else { None })
                     .collect();
             }
-            Facet::Project(keep) => {
-                self.hidden_projects = self
-                    .facets
-                    .iter()
-                    .filter_map(|l| match &l.facet {
-                        Facet::Project(name) if name != keep => Some(name.clone()),
-                        _ => None,
-                    })
+            1 => {
+                self.hidden_projects = kind
+                    .filter(|f| !keep(f))
+                    .filter_map(|f| if let Facet::Project(name) = f { Some(name.clone()) } else { None })
                     .collect();
             }
-            Facet::Untitled => self.toggle_facet(),
+            2 => {
+                self.only_paths = kind
+                    .filter(|f| keep(f))
+                    .filter_map(|f| if let Facet::Path(dir) = f { Some(dir.clone()) } else { None })
+                    .collect();
+                let only = &self.only_paths;
+                self.hidden_paths.retain(|h| !only.iter().any(|o| under(o, h)));
+            }
+            _ => self.hidden_untitled = !self.hidden_untitled,
         }
         self.reindex();
     }
@@ -523,6 +621,8 @@ impl Picker {
     fn show_all_facets(&mut self) {
         self.hidden_harnesses.clear();
         self.hidden_projects.clear();
+        self.hidden_paths.clear();
+        self.only_paths.clear();
         self.hidden_untitled = false;
         self.reindex();
     }
@@ -553,6 +653,17 @@ impl Picker {
         }
         if self.hidden_untitled {
             parts.push("−untitled".into());
+        }
+        let tilde = |dir: &String| self.tilde(dir);
+        match self.only_paths.iter().collect::<Vec<_>>().as_slice() {
+            [] => {}
+            [one] => parts.push(format!("only {}", tilde(one))),
+            many => parts.push(format!("only {} paths", many.len())),
+        }
+        match self.hidden_paths.iter().collect::<Vec<_>>().as_slice() {
+            [] => {}
+            [one] => parts.push(format!("−{}", tilde(one))),
+            many => parts.push(format!("−{} paths", many.len())),
         }
         (!parts.is_empty()).then(|| parts.join(" "))
     }
@@ -607,12 +718,14 @@ fn flip<T: Eq + std::hash::Hash>(set: &mut HashSet<T>, item: T) {
     }
 }
 
-/// Harnesses in listing order, then projects largest first, with their totals.
+/// Harnesses in listing order, projects largest first, the directories that
+/// group several session paths, then untitled, with their totals.
 fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
+    let rows: Vec<&Row> = rows.collect();
     let mut harnesses: BTreeMap<&str, (Side, usize, u64)> = BTreeMap::new();
     let mut projects: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
     let mut untitled = (0usize, 0u64);
-    for row in rows {
+    for row in rows.iter().copied() {
         let f = &row.facts;
         let h = harnesses.entry(f.harness.key()).or_insert((f.harness, 0, 0));
         h.1 += 1;
@@ -636,6 +749,7 @@ fn facets<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<FacetLine> {
         .collect();
     projects.sort_by_key(|l| std::cmp::Reverse(l.bytes));
     out.extend(projects);
+    out.extend(path_lines(&rows));
     if untitled.0 > 0 {
         out.push(FacetLine {
             facet: Facet::Untitled,
@@ -713,20 +827,120 @@ fn filter_key(app: &mut Picker, code: KeyCode) {
     app.reindex();
 }
 
-fn facet_key(app: &mut Picker, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('f' | 'q') => app.overlay = Overlay::None,
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.facet_cursor = (app.facet_cursor + 1).min(app.facets.len().saturating_sub(1));
+/// The filter panel: typing narrows its lines, the arrows move, `space`
+/// toggles, Ctrl-O keeps only the line, Ctrl-S only the matching lines of
+/// its kind, Ctrl-A shows everything.
+fn facet_key(app: &mut Picker, key: KeyEvent) {
+    let last = app.facet_view.len().saturating_sub(1);
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('o') => app.only_facet(),
+            KeyCode::Char('s') => app.only_matches(),
+            KeyCode::Char('a') => app.show_all_facets(),
+            KeyCode::Char('u') => app.edit_facet_query(String::clear),
+            _ => {}
         }
-        KeyCode::Char('k') | KeyCode::Up => app.facet_cursor = app.facet_cursor.saturating_sub(1),
-        KeyCode::Char('g') | KeyCode::Home => app.facet_cursor = 0,
-        KeyCode::Char('G') | KeyCode::End => app.facet_cursor = app.facets.len().saturating_sub(1),
+        return;
+    }
+    match key.code {
+        KeyCode::Esc if !app.facet_query.is_empty() => app.edit_facet_query(String::clear),
+        KeyCode::Esc | KeyCode::Enter => app.overlay = Overlay::None,
+        KeyCode::Down => app.facet_cursor = (app.facet_cursor + 1).min(last),
+        KeyCode::Up => app.facet_cursor = app.facet_cursor.saturating_sub(1),
+        KeyCode::PageDown => app.facet_cursor = (app.facet_cursor + 10).min(last),
+        KeyCode::PageUp => app.facet_cursor = app.facet_cursor.saturating_sub(10),
+        KeyCode::Home => app.facet_cursor = 0,
+        KeyCode::End => app.facet_cursor = last,
         KeyCode::Char(' ') => app.toggle_facet(),
-        KeyCode::Char('o') => app.only_facet(),
-        KeyCode::Char('a') => app.show_all_facets(),
+        KeyCode::Backspace => app.edit_facet_query(|q| {
+            q.pop();
+        }),
+        KeyCode::Char(c) => app.edit_facet_query(|q| q.push(c)),
         _ => {}
     }
+}
+
+/// True when `path` is `dir` or lies below it, on whole components.
+fn under(path: &str, dir: &str) -> bool {
+    std::path::Path::new(path).starts_with(dir)
+}
+
+/// Section order of the panel.
+fn facet_rank(facet: &Facet) -> usize {
+    match facet {
+        Facet::Harness(_) => 0,
+        Facet::Project(_) => 1,
+        Facet::Path(_) => 2,
+        Facet::Untitled => 3,
+    }
+}
+
+impl Picker {
+    /// A directory with this picker's home shown as `~`.
+    fn tilde(&self, dir: &str) -> String {
+        match std::path::Path::new(dir).strip_prefix(&self.home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => dir.to_string(),
+        }
+    }
+
+    /// What the panel's query is matched against.
+    fn facet_texts(&self, facet: &Facet) -> Vec<String> {
+        match facet {
+            Facet::Harness(side) => vec![side.key().to_string()],
+            Facet::Project(name) => vec![name.clone()],
+            Facet::Path(dir) => vec![self.tilde(dir), dir.clone()],
+            Facet::Untitled => vec!["(untitled)".to_string()],
+        }
+    }
+}
+
+/// How well `needle` matches `hay`, lower is better, ignoring case: a
+/// substring ranks by where it starts; otherwise the needle's characters in
+/// order rank behind every substring, by how far they spread.
+fn fuzzy(hay: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let (hay, needle) = (hay.to_lowercase(), needle.to_lowercase());
+    if let Some(at) = hay.find(&needle) {
+        return Some(at);
+    }
+    let mut chars = hay.char_indices();
+    let (mut first, mut last) = (None, 0);
+    for wanted in needle.chars() {
+        let (at, _) = chars.find(|&(_, c)| c == wanted)?;
+        first.get_or_insert(at);
+        last = at;
+    }
+    Some(1 << 20 | (last - first.unwrap_or(last)))
+}
+
+/// Directories above the session paths that hold more than one of them,
+/// leaving out any that holds every one, since hiding or keeping it would
+/// change nothing: `~/Projects/_myself` when several projects sit there.
+fn path_lines(rows: &[&Row]) -> Vec<FacetLine> {
+    let paths: BTreeMap<&str, (usize, u64)> = rows.iter().fold(BTreeMap::new(), |mut acc, row| {
+        let entry = acc.entry(row.facts.path.as_str()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += row.facts.bytes;
+        acc
+    });
+    let mut dirs: BTreeMap<String, (usize, usize, u64)> = BTreeMap::new();
+    for (path, (sessions, bytes)) in &paths {
+        for dir in std::path::Path::new(path).ancestors().skip(1) {
+            let Some(dir) = dir.to_str().filter(|d| !d.is_empty() && *d != "/") else { continue };
+            let entry = dirs.entry(dir.to_string()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += sessions;
+            entry.2 += bytes;
+        }
+    }
+    dirs.into_iter()
+        .filter(|(_, (held, _, _))| *held > 1 && *held < paths.len())
+        .map(|(dir, (_, sessions, bytes))| FacetLine { facet: Facet::Path(dir), sessions, bytes })
+        .collect()
 }
 
 fn list_key(app: &mut Picker, code: KeyCode) {
@@ -994,7 +1208,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &Picker) {
         ("a / A", "select or deselect every shown row / clear all"),
         ("p", "toggle every shown row in this path"),
         ("/", "filter by id, title, or path"),
-        ("f", "show or hide harnesses, projects, and untitled"),
+        ("f", "filter panel: type to narrow it; harnesses, projects, paths, untitled"),
         ("U", "hide or show sessions without a title"),
     ]
     .iter()
@@ -1036,15 +1250,17 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &Picker) {
 }
 
 fn draw_filters(frame: &mut Frame, area: Rect, app: &Picker) {
-    let area = tui::centered(area, 60, 80);
+    let area = tui::centered(area, 70, 80);
     frame.render_widget(Clear, area);
     let mut items: Vec<ListItem> = Vec::new();
     let mut section = "";
     let mut cursor_item = 0;
-    for (i, line) in app.facets.iter().enumerate() {
+    let width = usize::from(area.width.saturating_sub(26)).clamp(16, 64);
+    for (pos, line) in app.facet_view.iter().map(|&i| &app.facets[i]).enumerate() {
         let (heading, name) = match &line.facet {
             Facet::Harness(side) => ("harness", side.key().to_string()),
             Facet::Project(name) => ("project", name.clone()),
+            Facet::Path(dir) => ("path", app.tilde(dir)),
             Facet::Untitled => ("title", "(untitled)".to_string()),
         };
         if heading != section {
@@ -1054,41 +1270,52 @@ fn draw_filters(frame: &mut Frame, area: Rect, app: &Picker) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))));
         }
-        if i == app.facet_cursor {
+        if pos == app.facet_cursor {
             cursor_item = items.len();
         }
         let shown = app.facet_shown(&line.facet);
         let style = if shown { Style::default() } else { Style::default().fg(DIM) };
+        // Paths keep their tail, where the distinguishing part sits.
+        let name = if matches!(line.facet, Facet::Path(_)) { crate::shorten(&name, width) } else { clip(&name, width) };
         items.push(ListItem::new(Line::from(Span::styled(
             format!(
-                "  {} {:<32} {:>5} · {:>9}",
+                "  {} {:<width$} {:>5} · {:>9}",
                 if shown { "[x]" } else { "[ ]" },
-                clip(&name, 32),
+                name,
                 line.sessions,
                 human_size(line.bytes)
             ),
             style,
         ))));
     }
+    if items.is_empty() {
+        items.push(ListItem::new(Span::styled("  nothing matches", Style::default().fg(DIM))));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
         .split(Block::bordered().inner(area));
     frame.render_widget(
         Block::bordered().border_type(BorderType::Rounded).title(" filters ").title_alignment(Alignment::Center),
         area,
     );
-    let height = usize::from(chunks[0].height);
+    let query = if app.facet_query.is_empty() {
+        Span::styled(" type to narrow▏", Style::default().fg(DIM))
+    } else {
+        Span::styled(format!(" {}▏", app.facet_query), Style::default().fg(ACCENT))
+    };
+    frame.render_widget(Paragraph::new(Line::from(query)), chunks[0]);
+    let height = usize::from(chunks[1].height);
     let mut state = ListState::default().with_offset(centered_offset(cursor_item, items.len(), height));
-    state.select(Some(cursor_item));
+    state.select((!app.facet_view.is_empty()).then_some(cursor_item));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, chunks[0], &mut state);
+    frame.render_stateful_widget(list, chunks[1], &mut state);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " space show/hide · o only this · a show all · esc close",
+            " ↑↓ move · space show/hide · ^O only this · ^S only matches · ^A show all · esc clear/close",
             Style::default().fg(DIM),
         ))),
-        chunks[1],
+        chunks[2],
     );
 }
 
@@ -1167,6 +1394,7 @@ mod tests {
             now_ms: NOW,
             settings,
             extra_keys: Vec::new(),
+            home: None,
         })
     }
 
@@ -1400,6 +1628,7 @@ mod tests {
             now_ms: NOW,
             settings: Vec::new(),
             extra_keys: Vec::new(),
+            home: None,
         });
         list_key(&mut p, KeyCode::Char('q'));
         assert!(!p.cancelled);
@@ -1457,5 +1686,101 @@ mod tests {
         assert_eq!(centered_offset(94, len, height), 89);
         assert_eq!(centered_offset(99, len, height), 89, "pinned to the bottom");
         assert_eq!(centered_offset(3, 8, height), 0, "a list that fits never scrolls");
+    }
+
+    fn press(p: &mut Picker, code: KeyCode, ctrl: bool) {
+        let modifiers = if ctrl { KeyModifiers::CONTROL } else { KeyModifiers::empty() };
+        p.handle(KeyEvent::new(code, modifiers));
+    }
+
+    fn type_text(p: &mut Picker, text: &str) {
+        for c in text.chars() {
+            press(p, KeyCode::Char(c), false);
+        }
+    }
+
+    fn panel(p: &Picker) -> Vec<String> {
+        p.facet_view
+            .iter()
+            .map(|&i| match &p.facets[i].facet {
+                Facet::Harness(side) => format!("harness {}", side.key()),
+                Facet::Project(name) => format!("project {name}"),
+                Facet::Path(dir) => format!("path {dir}"),
+                Facet::Untitled => "untitled".into(),
+            })
+            .collect()
+    }
+
+    fn projects_tree() -> Picker {
+        picker(
+            vec![
+                row(Side::Pi, "m1", "/h/Projects/_myself/notes", 1, 10, false),
+                row(Side::Pi, "m2", "/h/Projects/_myself/blog", 1, 10, false),
+                row(Side::Pi, "w1", "/h/Projects/work/api", 1, 10, false),
+                row(Side::Pi, "w2", "/h/Projects/work/web", 1, 10, false),
+                row(Side::Pi, "t1", "/tmp/scratch", 1, 10, false),
+            ],
+            None,
+        )
+    }
+
+    #[test]
+    fn only_directories_grouping_some_paths_become_path_lines() {
+        let p = projects_tree();
+        let paths: Vec<String> = panel(&p).into_iter().filter(|l| l.starts_with("path")).collect();
+        // `/h` and `/h/Projects` hold four of five paths; `/tmp` holds one.
+        assert_eq!(
+            paths,
+            vec!["path /h", "path /h/Projects", "path /h/Projects/_myself", "path /h/Projects/work"]
+        );
+    }
+
+    #[test]
+    fn typing_in_the_panel_narrows_it_and_ctrl_o_keeps_one_path() {
+        let mut p = projects_tree();
+        press(&mut p, KeyCode::Char('f'), false);
+        type_text(&mut p, "_myself");
+        assert_eq!(panel(&p), vec!["path /h/Projects/_myself"]);
+        press(&mut p, KeyCode::Char('o'), true);
+        assert_eq!(shown_ids(&p), vec!["m2", "m1"]);
+        assert_eq!(p.hiding().as_deref(), Some("only /h/Projects/_myself"));
+        press(&mut p, KeyCode::Esc, false);
+        assert!(p.facet_query.is_empty() && p.overlay == Overlay::Filters, "esc clears the query first");
+        press(&mut p, KeyCode::Esc, false);
+        assert_eq!(p.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn ctrl_s_keeps_every_matching_project_and_space_hides_a_path() {
+        let mut p = projects_tree();
+        press(&mut p, KeyCode::Char('f'), false);
+        // Fuzzy: n then t, in that order, only in "notes".
+        type_text(&mut p, "nt");
+        assert_eq!(panel(&p), vec!["project notes"]);
+        press(&mut p, KeyCode::Backspace, false);
+        press(&mut p, KeyCode::Backspace, false);
+        type_text(&mut p, "o");
+        let projects: Vec<String> = panel(&p).into_iter().filter(|l| l.starts_with("project")).collect();
+        assert_eq!(projects, vec!["project notes", "project blog"], "earliest substring first");
+        p.facet_cursor = 0;
+        press(&mut p, KeyCode::Char('s'), true);
+        assert_eq!(shown_ids(&p), vec!["m2", "m1"]);
+        press(&mut p, KeyCode::Char('a'), true);
+        press(&mut p, KeyCode::Char('u'), true);
+        type_text(&mut p, "/h/projects/work");
+        assert_eq!(panel(&p).first().map(String::as_str), Some("path /h/Projects/work"));
+        press(&mut p, KeyCode::Char(' '), false);
+        assert_eq!(shown_ids(&p), vec!["m2", "m1", "t1"]);
+    }
+
+    #[test]
+    fn path_filters_survive_a_rebuilt_picker() {
+        let mut p = projects_tree();
+        p.only_paths.insert("/h/Projects/work".into());
+        p.reindex();
+        let kept = p.keep();
+        let mut q = projects_tree();
+        q.restore(kept);
+        assert_eq!(shown_ids(&q), vec!["w1", "w2"]);
     }
 }

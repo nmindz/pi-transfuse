@@ -177,6 +177,7 @@ impl RemoteTab {
             now_ms: self.now_ms,
             settings: migrate::settings(false, None),
             extra_keys: extra_keys(),
+            home: Some(plan.home.clone()),
         };
         let mut picker = Picker::embedded(spec);
         if let Some(old) = &self.picker {

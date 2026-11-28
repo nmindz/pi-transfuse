@@ -190,8 +190,9 @@ pub enum Rule {
     Harness(Vec<Side>),
     /// Project names, lowercase.
     Project(Vec<String>),
-    /// Directories; a session matches at or below one.
-    Path(Vec<PathBuf>),
+    /// Directories; a session matches at or below one. Keeps what was typed,
+    /// to resolve again against another host's home.
+    Path { typed: Vec<String>, dirs: Vec<PathBuf> },
 }
 
 impl FromStr for Rule {
@@ -215,7 +216,10 @@ impl FromStr for Rule {
                 .collect::<Result<_, _>>()
                 .map(Rule::Harness),
             "project" => Ok(Rule::Project(values.iter().map(|v| v.to_lowercase()).collect())),
-            "path" => Ok(Rule::Path(values.iter().flat_map(|v| path_forms(v)).collect())),
+            "path" => Ok(Rule::Path {
+                typed: values.iter().map(|v| v.to_string()).collect(),
+                dirs: values.iter().flat_map(|v| path_forms(v)).collect(),
+            }),
             other => Err(format!("unknown field {other:?}: use harness, project, or path")),
         }
     }
@@ -242,12 +246,34 @@ fn path_forms(text: &str) -> Vec<PathBuf> {
     out
 }
 
+/// A directory as typed, resolved on another host: `~` is `home` there, and
+/// a relative path is taken from that home, since this host's working
+/// directory and symlinks mean nothing there.
+fn remote_forms(text: &str, home: &str) -> PathBuf {
+    let home = Path::new(home);
+    match text.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        _ if Path::new(text).is_absolute() => PathBuf::from(text),
+        _ => home.join(text),
+    }
+}
+
 impl Rule {
     fn matches(&self, facts: &Facts) -> bool {
         match self {
             Rule::Harness(sides) => sides.contains(&facts.harness),
             Rule::Project(names) => names.iter().any(|n| cmp_ci(n, &facts.project) == Ordering::Equal),
-            Rule::Path(dirs) => dirs.iter().any(|d| Path::new(&facts.path).starts_with(d)),
+            Rule::Path { dirs, .. } => dirs.iter().any(|d| Path::new(&facts.path).starts_with(d)),
+        }
+    }
+
+    fn on_host(&self, home: &str) -> Rule {
+        match self {
+            Rule::Path { typed, .. } => Rule::Path {
+                typed: typed.clone(),
+                dirs: typed.iter().map(|t| remote_forms(t, home)).collect(),
+            },
+            other => other.clone(),
         }
     }
 }
@@ -295,6 +321,17 @@ impl Scope {
             && self.filter.as_deref().is_none_or(|needle| facts.mentions(needle))
             && (!self.hide_untitled || !facts.title.trim().is_empty())
     }
+
+    /// This scope for sessions of another host whose home is `home`: path
+    /// rules resolve there.
+    pub fn on_host(&self, home: &str) -> Scope {
+        Scope {
+            include: self.include.iter().map(|r| r.on_host(home)).collect(),
+            exclude: self.exclude.iter().map(|r| r.on_host(home)).collect(),
+            filter: self.filter.clone(),
+            hide_untitled: self.hide_untitled,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +359,17 @@ pub mod tests {
             filter: None,
             hide_untitled: false,
         }
+    }
+
+    #[test]
+    fn path_rules_resolve_against_another_hosts_home() {
+        let there = |path: &str| facts(Side::Pi, "a", path, 0, 0);
+        let remote = scope(&["path=~/Projects/_myself"], &["path=Projects/_myself/old"]).on_host("/home/eve");
+        assert!(remote.admits(&there("/home/eve/Projects/_myself/notes")));
+        assert!(!remote.admits(&there("/home/eve/Projects/_myself/old/x")), "relative means under that home");
+        assert!(!remote.admits(&there("/home/eve/Projects/_myselfish")), "whole components only");
+        let absolute = scope(&["path=/srv/work"], &[]).on_host("/home/eve");
+        assert!(absolute.admits(&there("/srv/work/api")));
     }
 
     #[test]

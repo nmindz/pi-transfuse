@@ -136,7 +136,7 @@ sshd runs the remote command through your login shell without a terminal, so zsh
 
 `--relocate DIR` is a built-in `relocate` for the arriving sessions: each is restored as if it had run in `DIR` on the receiving host, so its header `cwd` becomes `DIR`, `additionalDirectories` and subagent cwds under the old cwd move beneath `DIR`, and it lands in `DIR`'s bucket. `DIR` must exist on the receiving host, and `~` there is that host's home. Every other byte of the session stays as it was.
 
-Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. The [filters](#sorting-and-filtering) work as for `compact`: `--include project=api,web` keeps those projects, `--hide-untitled` drops sessions without a title, `--older-than` sets the threshold (none by default), and `--yes` takes every match. Sessions a running omp holds on the sending host, and sessions the receiving host already has, live or packed, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are packed in place, open there, or already here. The browser's [Remote tab](#remote-tab) does the same interactively.
+Without session arguments `pull` and `push` open the [picker](#choosing-sessions) over the sending host's OMP sessions, where `D` toggles delete-source and `R` edits the relocation directory; both show in the top bar and in the confirmation. The [filters](#sorting-and-filtering) work as for `compact`: `--include project=api,web` keeps those projects, `--include path=~/Projects/_myself` keeps every session under that directory, `--hide-untitled` drops sessions without a title, `--older-than` sets the threshold (none by default), and `--yes` takes every match. A `path` filter names directories of the sending host: on `pull` and `list`, `~` and relative paths mean the remote user's home. Sessions a running omp holds on the sending host, and sessions the receiving host already has, live or packed, are dimmed and cannot be selected; named or taken under `--yes`, they are reported `held` or `conflict`. `--dry-run` prints the plan without packing anything, and `migrate list` shows the remote host's OMP sessions with which are packed in place, open there, or already here. The browser's [Remote tab](#remote-tab) does the same interactively.
 
 Sessions packed in place (`compact pack`) migrate too, and stay packed: the archive is checked end to end, sent as it is, checked again on arrival, and put in the bucket of its cwd, byte for byte. With `--relocate`, or when the cwd maps to another bucket on the receiving host, it is unpacked in the hidden staging directory, moved and rewritten, and packed again with the compression it came in. `--delete` removes the sender's archive once it arrived, unless the archive changed meanwhile.
 
@@ -193,7 +193,7 @@ A session's **path** is the directory it ran in; its **project** is that directo
 | `harness` | harness | `h` |
 | `title` | title, A→Z | `t` |
 
-`--include FIELD=VALUE[,VALUE…]` keeps sessions matching any of the values; `--exclude` drops them. Both repeat, and a session must match every `--include`. Fields: `harness` (`pi` or `omp`, `dsh`, `claude` or `claude-code`), `project` (folder name, any case), and `path` (that directory and everything below it, on whole path components; `~` expands). Excluded harnesses are not read at all. `--filter TEXT` keeps sessions whose id, title, or path contains the text, and `--hide-untitled` leaves out sessions without a title.
+`--include FIELD=VALUE[,VALUE…]` keeps sessions matching any of the values; `--exclude` drops them. Both repeat, and a session must match every `--include`. Fields: `harness` (`pi` or `omp`, `dsh`, `claude` or `claude-code`), `project` (folder name, any case), and `path` (that directory and everything below it, on whole path components; `~` expands, to the remote home for `migrate pull` and `migrate list`). Excluded harnesses are not read at all. `--filter TEXT` keeps sessions whose id, title, or path contains the text, and `--hide-untitled` leaves out sessions without a title.
 
 ```sh
 pi-transfuse stale --exclude harness=dsh --sort project
@@ -213,7 +213,7 @@ Without session arguments, `pack`, `unpack`, `push`, `pull`, `migrate pull` and 
 | `a` / `A` | select every shown session, or deselect them when all are selected (the header checkbox shows `[ ]`, `[-]`, `[x]`) / clear the whole selection |
 | `p` | toggle every shown session in the cursor's path |
 | `/` | filter by id, title, or path |
-| `f` | filter panel: show or hide each harness, project, and the untitled sessions, counted over what the search and threshold leave (`space` toggles, `o` shows only that harness or project, `a` shows all) |
+| `f` | filter panel over each harness, project, directory and the untitled sessions, counted over what the search and threshold leave (see below) |
 | `U` | hide or show sessions without a title |
 | `[` / `]` | lower / raise the unused-for threshold through 0, 7, 15, 30, 60, 90, 180, 365 days |
 | `u` `s` `z` `c` `d` `n` `h` `t` | sort by last used, size, archive size, created, path, project, harness, title; the same key again reverses |
@@ -221,6 +221,8 @@ Without session arguments, `pack`, `unpack`, `push`, `pull`, `migrate pull` and 
 | `?` / `q` | keys / cancel |
 
 The top bar shows the threshold, the order, and what the filters hide; the detail pane shows everything known about the session under the cursor. Hidden sessions are never acted on, even when selected. A session that cannot be restored because a live copy exists is dimmed and cannot be selected. Naming sessions (an id, an id prefix, or an archive path) skips the picker and ignores the threshold, `--yes` takes every match past the threshold, and `--dry-run` prints the plan; off a terminal one of them is required.
+
+The filter panel lists harnesses, projects, the directories that group several session paths (`~/Projects/_myself` when more than one project sits there; one holding every session is left out, since it filters nothing), and the untitled sessions. Typing narrows the panel by fuzzy match: a substring anywhere ranks first, earliest first, then the letters in order (`~/proj/w` finds `~/Projects/work`); a directory matches on its `~` form or its full path. `↑` `↓` move, `space` shows or hides the line under the cursor (a hidden directory hides everything below it), `Ctrl-O` shows only that harness, project or directory, `Ctrl-S` shows only the lines the search matches among the cursor's kind (several projects at once), `Ctrl-A` shows everything, `Ctrl-U` clears the search, and `esc` clears it, then closes. In the Remote tab, `~` is the sending host's home.
 
 ### Compression
 
